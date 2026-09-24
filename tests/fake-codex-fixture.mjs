@@ -604,7 +604,9 @@ rl.on("line", (line) => {
           }
         ];
 
-	        if (BEHAVIOR === "steerable-task") {
+	        if (BEHAVIOR === "steer-rejected") {
+	          emitTurnCompletedLater(thread.id, turnId, items, 2000);
+	        } else if (BEHAVIOR === "steerable-task" || BEHAVIOR === "steer-flaky") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {
 	            if (!steerableTurns.has(turnId)) {
@@ -659,6 +661,12 @@ rl.on("line", (line) => {
 	          .filter((item) => item.type === "text")
 	          .map((item) => item.text)
 	          .join("\\n");
+	        state.steerAttempts = (state.steerAttempts || 0) + 1;
+	        if (BEHAVIOR === "steer-rejected" || (BEHAVIOR === "steer-flaky" && state.steerAttempts === 1)) {
+	          saveState(state);
+	          send({ id: message.id, error: { code: -32000, message: "transient steer failure" } });
+	          break;
+	        }
 	        state.steers = [...(state.steers || []), { threadId: message.params.threadId, expectedTurnId: message.params.expectedTurnId, text: steerText }];
 	        saveState(state);
 	        const pendingSteer = steerableTurns.get(message.params.expectedTurnId);

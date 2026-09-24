@@ -288,6 +288,41 @@ test("send steers a running job's active turn", () => {
   assert.equal(ws.fakeState().steers.length, 1);
 });
 
+test("send retries a steer that fails transiently instead of dropping the message", () => {
+  const ws = makeWorkspace("steer-flaky");
+  const jobId = launchBackground(ws, ["long job with a flaky steer channel"]);
+
+  const sent = ws.companion(["send", jobId, "retry me", "--timeout-ms", "15000", "--json"]);
+  assert.equal(sent.status, 0, sent.stderr);
+  assert.equal(JSON.parse(sent.stdout).status, "delivered");
+
+  const waited = ws.companion(["wait", jobId, "--timeout-ms", "15000", "--json"]);
+  assert.equal(waited.status, 0, waited.stderr);
+  const result = ws.companion(["result", jobId]);
+  assert.match(result.stdout, /Steered: retry me/);
+  assert.equal(ws.fakeState().steerAttempts, 2);
+});
+
+test("messages the turn never accepts are reported as undelivered, not lost", () => {
+  const ws = makeWorkspace("steer-rejected");
+  const jobId = launchBackground(ws, ["job whose turn rejects steering"]);
+
+  const sent = ws.companion(["send", jobId, "you will not get this", "--no-follow-up", "--timeout-ms", "15000", "--json"]);
+  assert.equal(sent.status, 0, sent.stderr);
+  const delivery = JSON.parse(sent.stdout);
+  assert.equal(delivery.status, "finished-undelivered");
+
+  const result = ws.companion(["result", jobId]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Undelivered messages/);
+  assert.match(result.stdout, new RegExp(delivery.messageId));
+
+  const stored = JSON.parse(ws.companion(["result", jobId, "--json"]).stdout).storedJob;
+  assert.equal(stored.result.undeliveredMessages.length, 1);
+  assert.equal(stored.result.undeliveredMessages[0].id, delivery.messageId);
+  assert.match(stored.result.undeliveredMessages[0].error, /transient steer failure/);
+});
+
 test("send rejects empty messages and unknown jobs", () => {
   const ws = makeWorkspace();
   const task = ws.companion(["task", "seed"]);

@@ -84,81 +84,115 @@ function buildResumeParams(threadId, cwd, options = {}) {
   };
 }
 
-// Reads complete JSON lines appended to a job inbox after `offset` (in characters).
-function readInboxMessages(inboxFile, offset) {
+// Reads the complete lines appended to a job inbox after `offset` (in
+// characters). Each entry carries the offset just past its line, so a reader
+// only moves past a message once it has been handled.
+function readInboxEntries(inboxFile, offset) {
   let contents;
   try {
     contents = fs.readFileSync(inboxFile, "utf8");
   } catch {
-    return { messages: [], offset };
+    return [];
   }
-  const chunk = contents.slice(offset);
-  const lastNewline = chunk.lastIndexOf("\n");
-  if (lastNewline === -1) {
-    return { messages: [], offset };
+  const entries = [];
+  let cursor = offset;
+  for (;;) {
+    const newline = contents.indexOf("\n", cursor);
+    if (newline === -1) {
+      break;
+    }
+    const line = contents.slice(cursor, newline);
+    cursor = newline + 1;
+    let message = null;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      message = null;
+    }
+    const valid = message && typeof message.text === "string" && message.text.trim();
+    entries.push({ message: valid ? message : null, end: cursor });
   }
-  const messages = chunk
-    .slice(0, lastNewline)
-    .split("\n")
-    .filter((line) => line.trim())
-    .map((line) => {
-      try {
-        return JSON.parse(line);
-      } catch {
-        return null;
-      }
-    })
-    .filter((message) => message && typeof message.text === "string" && message.text.trim());
-  return { messages, offset: offset + lastNewline + 1 };
+  return entries;
 }
 
+const MAX_STEER_ATTEMPTS = 3;
+
 // Delivers messages that `send` appends to the job inbox into the active turn.
+// A message is only consumed once Codex accepts it; failures are retried in
+// order, and stop() reports every message the turn never received.
 function startInboxSteering(client, threadId, turnId, options = {}) {
   if (!options.inboxFile || !turnId) {
-    return () => {};
+    return { stop: async () => [] };
   }
   let offset = 0;
-  let busy = false;
+  let inFlight = null;
   let stopped = false;
+  const attempts = new Map();
+  const abandoned = [];
 
   const tick = async () => {
-    if (busy || stopped) {
-      return;
-    }
-    busy = true;
-    try {
-      const read = readInboxMessages(options.inboxFile, offset);
-      offset = read.offset;
-      for (const message of read.messages) {
-        if (stopped) {
-          break;
-        }
-        const label = message.id ? `message ${message.id}` : "message";
-        try {
-          await client.request("turn/steer", {
-            threadId,
-            expectedTurnId: turnId,
-            input: buildTurnInput(message.text)
-          });
-          emitProgress(options.onProgress, `Delivered ${label} to the running turn.`, null, { threadId, turnId });
-          options.onSteered?.(message);
-        } catch (error) {
-          emitProgress(options.onProgress, `Could not deliver ${label} to the running turn: ${error?.message ?? error}`, null);
-          options.onSteerFailed?.(message, error);
-        }
+    for (const entry of readInboxEntries(options.inboxFile, offset)) {
+      if (stopped) {
+        return;
       }
-    } finally {
-      busy = false;
+      if (!entry.message) {
+        offset = entry.end;
+        continue;
+      }
+      const message = entry.message;
+      const label = message.id ? `message ${message.id}` : "message";
+      try {
+        await client.request("turn/steer", {
+          threadId,
+          expectedTurnId: turnId,
+          input: buildTurnInput(message.text)
+        });
+        offset = entry.end;
+        emitProgress(options.onProgress, `Delivered ${label} to the running turn.`, null, { threadId, turnId });
+        options.onSteered?.(message);
+      } catch (error) {
+        const count = (attempts.get(entry.end) ?? 0) + 1;
+        attempts.set(entry.end, count);
+        const detail = error?.message ?? String(error);
+        emitProgress(
+          options.onProgress,
+          `Could not deliver ${label} to the running turn (attempt ${count}/${MAX_STEER_ATTEMPTS}): ${detail}`,
+          null
+        );
+        if (count < MAX_STEER_ATTEMPTS) {
+          return;
+        }
+        abandoned.push({ ...message, error: detail });
+        offset = entry.end;
+      }
     }
   };
 
-  const timer = setInterval(() => {
-    tick().catch(() => {});
-  }, options.inboxPollMs ?? 500);
-  tick().catch(() => {});
-  return () => {
-    stopped = true;
-    clearInterval(timer);
+  const schedule = () => {
+    if (inFlight || stopped) {
+      return;
+    }
+    inFlight = tick()
+      .catch(() => {})
+      .finally(() => {
+        inFlight = null;
+      });
+  };
+  const timer = setInterval(schedule, options.inboxPollMs ?? 500);
+  schedule();
+
+  return {
+    async stop() {
+      stopped = true;
+      clearInterval(timer);
+      if (inFlight) {
+        await inFlight;
+      }
+      const pending = readInboxEntries(options.inboxFile, offset)
+        .map((entry) => entry.message)
+        .filter(Boolean);
+      return [...abandoned, ...pending];
+    }
   };
 }
 
@@ -1234,7 +1268,8 @@ export async function runAppServerTurn(cwd, options = {}) {
       throw new Error("A prompt is required for this Codex run.");
     }
 
-    let stopSteering = () => {};
+    let steering = { stop: async () => [] };
+    let undeliveredMessages = [];
     let turnState;
     try {
       turnState = await captureTurn(
@@ -1251,18 +1286,17 @@ export async function runAppServerTurn(cwd, options = {}) {
         {
           onProgress: options.onProgress,
           onResponse: (response) => {
-            stopSteering = startInboxSteering(client, threadId, response.turn?.id ?? null, {
+            steering = startInboxSteering(client, threadId, response.turn?.id ?? null, {
               inboxFile: options.inboxFile,
               inboxPollMs: options.inboxPollMs,
               onProgress: options.onProgress,
-              onSteered: options.onSteered,
-              onSteerFailed: options.onSteerFailed
+              onSteered: options.onSteered
             });
           }
         }
       );
     } finally {
-      stopSteering();
+      undeliveredMessages = await steering.stop();
     }
 
     return {
@@ -1276,7 +1310,8 @@ export async function runAppServerTurn(cwd, options = {}) {
       stderr: cleanCodexStderr(client.stderr),
       fileChanges: turnState.fileChanges,
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
-      commandExecutions: turnState.commandExecutions
+      commandExecutions: turnState.commandExecutions,
+      undeliveredMessages
     };
   });
 }

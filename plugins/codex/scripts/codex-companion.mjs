@@ -65,7 +65,8 @@ import {
   renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
-  renderTaskResult
+  renderTaskResult,
+  renderUndeliveredMessages
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -721,24 +722,31 @@ async function executeTaskRun(request) {
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
   const failureMessage = result.error?.message ?? result.stderr ?? "";
-  const rendered = renderTaskResult(
-    {
-      rawOutput,
-      failureMessage,
-      reasoningSummary: result.reasoningSummary
-    },
-    {
-      title: taskMetadata.title,
-      jobId: request.jobId ?? null,
-      write: sandbox !== "read-only"
-    }
-  );
+  const undeliveredMessages = (result.undeliveredMessages ?? []).map((message) => ({
+    id: message.id ?? null,
+    text: message.text,
+    error: message.error ?? null
+  }));
+  const rendered =
+    renderTaskResult(
+      {
+        rawOutput,
+        failureMessage,
+        reasoningSummary: result.reasoningSummary
+      },
+      {
+        title: taskMetadata.title,
+        jobId: request.jobId ?? null,
+        write: sandbox !== "read-only"
+      }
+    ) + renderUndeliveredMessages(request.jobId, undeliveredMessages);
   const payload = {
     status: result.status,
     threadId: result.threadId,
     rawOutput,
     touchedFiles: result.touchedFiles,
-    reasoningSummary: result.reasoningSummary
+    reasoningSummary: result.reasoningSummary,
+    undeliveredMessages
   };
 
   return {

@@ -5,7 +5,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { MAX_JOBS, resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import { spawnSync } from "node:child_process";
+
+import { MAX_JOBS, listJobs, resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState, upsertJob } from "../plugins/codex/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -102,4 +104,17 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+});
+
+test("state updates break a lock whose owner process has exited", () => {
+  const workspace = makeTempDir();
+  const lockFile = path.join(resolveStateDir(workspace), "state.lock");
+  fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+  const exited = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: exited.pid, token: "dead-owner", createdAt: new Date().toISOString() }));
+
+  upsertJob(workspace, { id: "job-after-stale-lock", status: "queued" });
+
+  assert.equal(fs.existsSync(lockFile), false);
+  assert.equal(listJobs(workspace)[0].id, "job-after-stale-lock");
 });

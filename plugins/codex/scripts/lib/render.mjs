@@ -428,6 +428,23 @@ export function renderJobStatusReport(job) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+export function renderUndeliveredMessages(jobId, messages) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return "";
+  }
+  const lines = ["", "Undelivered messages (the turn ended before Codex accepted them):"];
+  for (const message of messages) {
+    const text = String(message.text ?? "").trim().replace(/\s+/g, " ");
+    const excerpt = text.length > 160 ? `${text.slice(0, 157)}...` : text;
+    const reason = message.error ? ` [${message.error}]` : "";
+    lines.push(`- ${message.id ?? "message"}: ${excerpt}${reason}`);
+  }
+  if (jobId) {
+    lines.push(`Send one again with \`send ${jobId} <message>\` to continue this thread in a follow-up job.`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 export function renderStoredJobResult(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `codex resume ${threadId}` : null;
@@ -444,7 +461,9 @@ export function renderStoredJobResult(job, storedJob) {
     (typeof storedJob?.result?.codex?.stdout === "string" && storedJob.result.codex.stdout) ||
     "";
   if (rawOutput) {
-    const output = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
+    const output =
+      (rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`) +
+      renderUndeliveredMessages(job.id, storedJob?.result?.undeliveredMessages);
     if (!threadId) {
       return output;
     }

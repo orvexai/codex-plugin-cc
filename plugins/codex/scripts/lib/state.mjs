@@ -76,28 +76,73 @@ export function ensureStateDir(cwd) {
   fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
 }
 
+function readLockOwner(lockFile) {
+  try {
+    const owner = JSON.parse(fs.readFileSync(lockFile, "utf8"));
+    return owner && typeof owner === "object" ? owner : null;
+  } catch {
+    return null;
+  }
+}
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+// A lock is stale only when its owner process is gone. A lock whose owner has
+// not been written yet (or is unreadable) is stale only once clearly abandoned.
+function findStaleLockToken(lockFile) {
+  const owner = readLockOwner(lockFile);
+  if (owner?.pid) {
+    return isProcessAlive(owner.pid) ? null : String(owner.token ?? "");
+  }
+  try {
+    return Date.now() - fs.statSync(lockFile).mtimeMs > LOCK_STALE_MS ? "" : null;
+  } catch {
+    return null;
+  }
+}
+
+function removeLockIfOwnedBy(lockFile, token) {
+  const owner = readLockOwner(lockFile);
+  if (String(owner?.token ?? "") === token) {
+    fs.rmSync(lockFile, { force: true });
+  }
+}
+
 // Serialises read-modify-write cycles on state.json across processes. Parallel
 // background jobs in one workspace otherwise overwrite each other's updates.
+// The lock records its owner so it is only ever broken when the owner is dead,
+// and only ever released by the process that holds it.
 function withStateLock(cwd, fn) {
   ensureStateDir(cwd);
   const lockFile = path.join(resolveStateDir(cwd), LOCK_FILE_NAME);
+  const token = `${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
-  let fd = null;
-  while (fd === null) {
+  for (;;) {
     try {
-      fd = fs.openSync(lockFile, "wx");
+      const fd = fs.openSync(lockFile, "wx");
+      try {
+        fs.writeSync(fd, JSON.stringify({ pid: process.pid, token, createdAt: nowIso() }));
+      } finally {
+        fs.closeSync(fd);
+      }
+      break;
     } catch (error) {
       if (error?.code !== "EEXIST") {
         throw error;
       }
-      let ageMs = 0;
-      try {
-        ageMs = Date.now() - fs.statSync(lockFile).mtimeMs;
-      } catch {
-        continue;
-      }
-      if (ageMs > LOCK_STALE_MS) {
-        fs.rmSync(lockFile, { force: true });
+      const staleToken = findStaleLockToken(lockFile);
+      if (staleToken !== null) {
+        removeLockIfOwnedBy(lockFile, staleToken);
         continue;
       }
       if (Date.now() > deadline) {
@@ -110,8 +155,7 @@ function withStateLock(cwd, fn) {
   try {
     return fn();
   } finally {
-    fs.closeSync(fd);
-    fs.rmSync(lockFile, { force: true });
+    removeLockIfOwnedBy(lockFile, token);
   }
 }
 
