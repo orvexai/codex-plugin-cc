@@ -354,6 +354,9 @@ rl.on("line", (line) => {
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }
+        if (BEHAVIOR === "resume-locked") {
+          throw new Error("thread " + message.params.threadId + " already has an active writer");
+        }
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
         state.lastThreadResume = {
@@ -632,6 +635,22 @@ rl.on("line", (line) => {
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);
 	        }
+	        break;
+	      }
+
+	      case "thread/fork": {
+	        const source = ensureThread(state, message.params.threadId);
+	        const forked = nextThread(state, message.params.cwd || source.cwd, message.params.ephemeral);
+	        const forkState = loadState();
+	        const forkedRecord = ensureThread(forkState, forked.id);
+	        forkedRecord.name = source.name || null;
+	        forkState.lastThreadFork = {
+	          sourceThreadId: message.params.threadId,
+	          threadId: forked.id,
+	          sandbox: message.params.sandbox ?? null
+	        };
+	        saveState(forkState);
+	        send({ id: message.id, result: { thread: buildThread(forkedRecord), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: forkedRecord.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
 	        break;
 	      }
 

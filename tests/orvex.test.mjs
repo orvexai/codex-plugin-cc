@@ -251,6 +251,25 @@ test("send continues a finished job's thread in a follow-up job that inherits it
   assert.equal(latest.title, "Codex Follow-up");
 });
 
+test("send continues on a fork when another process still holds the finished job's thread", () => {
+  const ws = makeWorkspace("resume-locked");
+  const first = ws.companion(["task", "--write", "--json", "first pass"]);
+  assert.equal(first.status, 0, first.stderr);
+  const threadId = JSON.parse(first.stdout).threadId;
+  const jobId = JSON.parse(ws.companion(["status", "--json"]).stdout).latestFinished.id;
+
+  const sent = ws.companion(["send", jobId, "please follow up on the findings", "--json"]);
+  assert.equal(sent.status, 0, sent.stderr);
+  const payload = JSON.parse(sent.stdout);
+  assert.match(payload.rawOutput, /Follow-up prompt accepted/);
+
+  const state = ws.fakeState();
+  assert.equal(state.lastThreadFork.sourceThreadId, threadId);
+  assert.equal(state.lastThreadFork.sandbox, "workspace-write");
+  assert.equal(payload.threadId, state.lastThreadFork.threadId);
+  assert.notEqual(payload.threadId, threadId);
+});
+
 test("send steers a running job's active turn", () => {
   const ws = makeWorkspace("steerable-task");
   const jobId = launchBackground(ws, ["long job that accepts guidance"]);

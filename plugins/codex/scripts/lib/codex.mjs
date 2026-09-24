@@ -1183,13 +1183,36 @@ export async function runAppServerTurn(cwd, options = {}) {
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
-      const response = await resumeThread(client, options.resumeThreadId, cwd, {
-        model: options.model,
-        sandbox: options.sandbox,
-        config: options.config,
-        ephemeral: false
-      });
-      threadId = response.thread.id;
+      try {
+        const response = await resumeThread(client, options.resumeThreadId, cwd, {
+          model: options.model,
+          sandbox: options.sandbox,
+          config: options.config,
+          ephemeral: false
+        });
+        threadId = response.thread.id;
+      } catch (error) {
+        // Another app-server (typically the shared broker) still holds the
+        // thread's writer. A fork carries the full history into a new thread.
+        if (!/active writer/i.test(String(error?.message ?? error))) {
+          throw error;
+        }
+        emitProgress(
+          options.onProgress,
+          `Thread ${options.resumeThreadId} is held by another Codex process; continuing on a fork of it.`,
+          "starting"
+        );
+        const response = await client.request("thread/fork", {
+          threadId: options.resumeThreadId,
+          cwd,
+          model: options.model ?? null,
+          approvalPolicy: "never",
+          sandbox: options.sandbox ?? "read-only",
+          ...(options.config ? { config: options.config } : {}),
+          ephemeral: false
+        });
+        threadId = response.thread.id;
+      }
     } else {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
       const response = await startThread(client, cwd, {

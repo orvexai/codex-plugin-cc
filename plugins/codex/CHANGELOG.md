@@ -12,6 +12,7 @@ Orvex flavour, forked from openai/codex-plugin-cc 1.0.6.
 - `setup --install-cli` installs the stable `orvex-codex` launcher; session start keeps it pointed at the current plugin version.
 - Job state: a cross-process lock and atomic writes, so parallel jobs no longer overwrite each other's status; history kept for 200 jobs; job ids resolve across workspaces.
 - Broker: a failed mid-turn request no longer orphans the running turn's notifications.
+- Follow-ups: when another Codex process still holds a finished job's thread (the shared broker keeps threads loaded), `send` continues on a `thread/fork` of it, so no history is lost.
 - The `codex:codex-rescue` forwarder runs on Haiku.
 - `npm test` scrubs Claude Code session variables so the suite passes inside a Claude Code session.
 
