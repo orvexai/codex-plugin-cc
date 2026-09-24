@@ -5,7 +5,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import { MAX_JOBS, resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -45,7 +45,7 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
   const stateFile = resolveStateFile(workspace);
   fs.mkdirSync(path.dirname(stateFile), { recursive: true });
 
-  const jobs = Array.from({ length: 51 }, (_, index) => {
+  const jobs = Array.from({ length: MAX_JOBS + 1 }, (_, index) => {
     const jobId = `job-${index}`;
     const updatedAt = new Date(Date.UTC(2026, 0, 1, 0, index, 0)).toISOString();
     const logFile = resolveJobLogFile(workspace, jobId);
@@ -83,22 +83,22 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
 
   const prunedJobFile = resolveJobFile(workspace, "job-0");
   const prunedLogFile = resolveJobLogFile(workspace, "job-0");
-  const retainedJobFile = resolveJobFile(workspace, "job-50");
-  const retainedLogFile = resolveJobLogFile(workspace, "job-50");
+  const retainedJobFile = resolveJobFile(workspace, `job-${MAX_JOBS}`);
+  const retainedLogFile = resolveJobLogFile(workspace, `job-${MAX_JOBS}`);
   const jobsDir = path.dirname(prunedJobFile);
 
   assert.equal(fs.existsSync(retainedJobFile), true);
   assert.equal(fs.existsSync(retainedLogFile), true);
 
   const savedState = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-  assert.equal(savedState.jobs.length, 50);
+  assert.equal(savedState.jobs.length, MAX_JOBS);
   assert.deepEqual(
     savedState.jobs.map((job) => job.id),
-    Array.from({ length: 50 }, (_, index) => `job-${50 - index}`)
+    Array.from({ length: MAX_JOBS }, (_, index) => `job-${MAX_JOBS - index}`)
   );
   assert.deepEqual(
     fs.readdirSync(jobsDir).sort(),
-    Array.from({ length: 50 }, (_, index) => `job-${index + 1}`)
+    Array.from({ length: MAX_JOBS }, (_, index) => `job-${index + 1}`)
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );

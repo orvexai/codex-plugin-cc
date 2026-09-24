@@ -16,6 +16,7 @@ const readline = require("node:readline");
 	const STATE_PATH = ${JSON.stringify(statePath)};
 	const BEHAVIOR = ${JSON.stringify(behavior)};
 	const interruptibleTurns = new Map();
+	const steerableTurns = new Map();
 
 	function loadState() {
 	  if (!fs.existsSync(STATE_PATH)) {
@@ -313,6 +314,15 @@ rl.on("line", (line) => {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
+        const startRecordState = loadState();
+        startRecordState.lastThreadStart = {
+          threadId: thread.id,
+          cwd: message.params.cwd ?? null,
+          sandbox: message.params.sandbox ?? null,
+          config: message.params.config ?? null,
+          model: message.params.model ?? null
+        };
+        saveState(startRecordState);
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
@@ -346,6 +356,12 @@ rl.on("line", (line) => {
         }
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
+        state.lastThreadResume = {
+          threadId: message.params.threadId,
+          sandbox: message.params.sandbox ?? null,
+          config: message.params.config ?? null,
+          model: message.params.model ?? null
+        };
         saveState(state);
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         break;
@@ -585,7 +601,18 @@ rl.on("line", (line) => {
           }
         ];
 
-	        if (BEHAVIOR === "interruptible-slow-task") {
+	        if (BEHAVIOR === "steerable-task") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          const timer = setTimeout(() => {
+	            if (!steerableTurns.has(turnId)) {
+	              return;
+	            }
+	            steerableTurns.delete(turnId);
+	            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text: "Finished without steering.", phase: "final_answer" } } });
+	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+	          }, 8000);
+	          steerableTurns.set(turnId, { threadId: thread.id, timer });
+	        } else if (BEHAVIOR === "interruptible-slow-task") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {
 	            if (!interruptibleTurns.has(turnId)) {
@@ -605,6 +632,28 @@ rl.on("line", (line) => {
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);
 	        }
+	        break;
+	      }
+
+	      case "turn/steer": {
+	        const steerText = (message.params.input || [])
+	          .filter((item) => item.type === "text")
+	          .map((item) => item.text)
+	          .join("\\n");
+	        state.steers = [...(state.steers || []), { threadId: message.params.threadId, expectedTurnId: message.params.expectedTurnId, text: steerText }];
+	        saveState(state);
+	        const pendingSteer = steerableTurns.get(message.params.expectedTurnId);
+	        if (!pendingSteer) {
+	          send({ id: message.id, error: { code: -32000, message: "no active turn " + message.params.expectedTurnId } });
+	          break;
+	        }
+	        send({ id: message.id, result: { turnId: message.params.expectedTurnId } });
+	        clearTimeout(pendingSteer.timer);
+	        steerableTurns.delete(message.params.expectedTurnId);
+	        setTimeout(() => {
+	          send({ method: "item/completed", params: { threadId: pendingSteer.threadId, turnId: message.params.expectedTurnId, item: { type: "agentMessage", id: "msg_" + message.params.expectedTurnId, text: "Steered: " + steerText, phase: "final_answer" } } });
+	          send({ method: "turn/completed", params: { threadId: pendingSteer.threadId, turn: buildTurn(message.params.expectedTurnId, "completed") } });
+	        }, 300);
 	        break;
 	      }
 

@@ -66,6 +66,7 @@ function buildThreadParams(cwd, options = {}) {
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only",
+    ...(options.config ? { config: options.config } : {}),
     serviceName: SERVICE_NAME,
     ephemeral: options.ephemeral ?? true
   };
@@ -78,7 +79,86 @@ function buildResumeParams(threadId, cwd, options = {}) {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? "read-only"
+    sandbox: options.sandbox ?? "read-only",
+    ...(options.config ? { config: options.config } : {})
+  };
+}
+
+// Reads complete JSON lines appended to a job inbox after `offset` (in characters).
+function readInboxMessages(inboxFile, offset) {
+  let contents;
+  try {
+    contents = fs.readFileSync(inboxFile, "utf8");
+  } catch {
+    return { messages: [], offset };
+  }
+  const chunk = contents.slice(offset);
+  const lastNewline = chunk.lastIndexOf("\n");
+  if (lastNewline === -1) {
+    return { messages: [], offset };
+  }
+  const messages = chunk
+    .slice(0, lastNewline)
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter((message) => message && typeof message.text === "string" && message.text.trim());
+  return { messages, offset: offset + lastNewline + 1 };
+}
+
+// Delivers messages that `send` appends to the job inbox into the active turn.
+function startInboxSteering(client, threadId, turnId, options = {}) {
+  if (!options.inboxFile || !turnId) {
+    return () => {};
+  }
+  let offset = 0;
+  let busy = false;
+  let stopped = false;
+
+  const tick = async () => {
+    if (busy || stopped) {
+      return;
+    }
+    busy = true;
+    try {
+      const read = readInboxMessages(options.inboxFile, offset);
+      offset = read.offset;
+      for (const message of read.messages) {
+        if (stopped) {
+          break;
+        }
+        const label = message.id ? `message ${message.id}` : "message";
+        try {
+          await client.request("turn/steer", {
+            threadId,
+            expectedTurnId: turnId,
+            input: buildTurnInput(message.text)
+          });
+          emitProgress(options.onProgress, `Delivered ${label} to the running turn.`, null, { threadId, turnId });
+          options.onSteered?.(message);
+        } catch (error) {
+          emitProgress(options.onProgress, `Could not deliver ${label} to the running turn: ${error?.message ?? error}`, null);
+          options.onSteerFailed?.(message, error);
+        }
+      }
+    } finally {
+      busy = false;
+    }
+  };
+
+  const timer = setInterval(() => {
+    tick().catch(() => {});
+  }, options.inboxPollMs ?? 500);
+  tick().catch(() => {});
+  return () => {
+    stopped = true;
+    clearInterval(timer);
   };
 }
 
@@ -1106,6 +1186,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       const response = await resumeThread(client, options.resumeThreadId, cwd, {
         model: options.model,
         sandbox: options.sandbox,
+        config: options.config,
         ephemeral: false
       });
       threadId = response.thread.id;
@@ -1114,6 +1195,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       const response = await startThread(client, cwd, {
         model: options.model,
         sandbox: options.sandbox,
+        config: options.config,
         ephemeral: options.persistThread ? false : true,
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
       });
@@ -1129,19 +1211,36 @@ export async function runAppServerTurn(cwd, options = {}) {
       throw new Error("A prompt is required for this Codex run.");
     }
 
-    const turnState = await captureTurn(
-      client,
-      threadId,
-      () =>
-        client.request("turn/start", {
-          threadId,
-          input: buildTurnInput(prompt),
-          model: options.model ?? null,
-          effort: options.effort ?? null,
-          outputSchema: options.outputSchema ?? null
-        }),
-      { onProgress: options.onProgress }
-    );
+    let stopSteering = () => {};
+    let turnState;
+    try {
+      turnState = await captureTurn(
+        client,
+        threadId,
+        () =>
+          client.request("turn/start", {
+            threadId,
+            input: buildTurnInput(prompt),
+            model: options.model ?? null,
+            effort: options.effort ?? null,
+            outputSchema: options.outputSchema ?? null
+          }),
+        {
+          onProgress: options.onProgress,
+          onResponse: (response) => {
+            stopSteering = startInboxSteering(client, threadId, response.turn?.id ?? null, {
+              inboxFile: options.inboxFile,
+              inboxPollMs: options.inboxPollMs,
+              onProgress: options.onProgress,
+              onSteered: options.onSteered,
+              onSteerFailed: options.onSteerFailed
+            });
+          }
+        }
+      );
+    } finally {
+      stopSteering();
+    }
 
     return {
       status: buildResultStatus(turnState),

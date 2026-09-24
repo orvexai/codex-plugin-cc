@@ -1,7 +1,7 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { findJobAcrossWorkspaces, getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -210,6 +210,20 @@ function matchJobReference(jobs, reference, predicate = () => true) {
   throw new Error(`No job found for "${reference}". Run /codex:status to list known jobs.`);
 }
 
+function matchesLocalJob(jobs, reference) {
+  return jobs.some((job) => job.id === reference || job.id.startsWith(reference));
+}
+
+// A job id that is not known in the current workspace may belong to a job that
+// was launched with a different --cwd. Resolve it to its own workspace.
+export function resolveJobWorkspace(cwd, reference) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  if (!reference || matchesLocalJob(listJobs(workspaceRoot), reference)) {
+    return workspaceRoot;
+  }
+  return findJobAcrossWorkspaces(reference)?.workspaceRoot ?? workspaceRoot;
+}
+
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
@@ -240,7 +254,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
 }
 
 export function buildSingleJobSnapshot(cwd, reference, options = {}) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const workspaceRoot = resolveJobWorkspace(cwd, reference);
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
   const selected = matchJobReference(jobs, reference);
   if (!selected) {
@@ -254,7 +268,7 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 }
 
 export function resolveResultJob(cwd, reference) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const workspaceRoot = resolveJobWorkspace(cwd, reference);
   const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
   const selected = matchJobReference(
     jobs,
@@ -279,7 +293,7 @@ export function resolveResultJob(cwd, reference) {
 }
 
 export function resolveCancelableJob(cwd, reference, options = {}) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const workspaceRoot = resolveJobWorkspace(cwd, reference);
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
   const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
 

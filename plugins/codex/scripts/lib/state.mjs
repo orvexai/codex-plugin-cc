@@ -7,10 +7,20 @@ import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
+const GLOBAL_CONFIG_ENV = "CODEX_COMPANION_CONFIG";
 const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
+const LOCK_FILE_NAME = "state.lock";
 const JOBS_DIR_NAME = "jobs";
-const MAX_JOBS = 50;
+export const MAX_JOBS = 200;
+const LOCK_TIMEOUT_MS = 15000;
+const LOCK_STALE_MS = 30000;
+
+const sleepCell = new Int32Array(new SharedArrayBuffer(4));
+
+function sleepSync(ms) {
+  Atomics.wait(sleepCell, 0, 0, ms);
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -26,6 +36,19 @@ function defaultState() {
   };
 }
 
+// Write-then-rename so concurrent readers never observe a half-written file.
+export function writeFileAtomic(filePath, contents) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+  fs.writeFileSync(tempPath, contents, "utf8");
+  fs.renameSync(tempPath, filePath);
+}
+
+export function resolveStateRootDir() {
+  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
+  return pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
+}
+
 export function resolveStateDir(cwd) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   let canonicalWorkspaceRoot = workspaceRoot;
@@ -38,9 +61,7 @@ export function resolveStateDir(cwd) {
   const slugSource = path.basename(workspaceRoot) || "workspace";
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
-  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
-  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
-  return path.join(stateRoot, `${slug}-${hash}`);
+  return path.join(resolveStateRootDir(), `${slug}-${hash}`);
 }
 
 export function resolveStateFile(cwd) {
@@ -53,6 +74,45 @@ export function resolveJobsDir(cwd) {
 
 export function ensureStateDir(cwd) {
   fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
+}
+
+// Serialises read-modify-write cycles on state.json across processes. Parallel
+// background jobs in one workspace otherwise overwrite each other's updates.
+function withStateLock(cwd, fn) {
+  ensureStateDir(cwd);
+  const lockFile = path.join(resolveStateDir(cwd), LOCK_FILE_NAME);
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  let fd = null;
+  while (fd === null) {
+    try {
+      fd = fs.openSync(lockFile, "wx");
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+      let ageMs = 0;
+      try {
+        ageMs = Date.now() - fs.statSync(lockFile).mtimeMs;
+      } catch {
+        continue;
+      }
+      if (ageMs > LOCK_STALE_MS) {
+        fs.rmSync(lockFile, { force: true });
+        continue;
+      }
+      if (Date.now() > deadline) {
+        throw new Error(`Timed out waiting for the Codex companion state lock at ${lockFile}.`);
+      }
+      sleepSync(5 + Math.floor(Math.random() * 20));
+    }
+  }
+
+  try {
+    return fn();
+  } finally {
+    fs.closeSync(fd);
+    fs.rmSync(lockFile, { force: true });
+  }
 }
 
 export function loadState(cwd) {
@@ -89,7 +149,7 @@ function removeFileIfExists(filePath) {
   }
 }
 
-export function saveState(cwd, state) {
+function saveStateUnlocked(cwd, state) {
   const previousJobs = loadState(cwd).jobs;
   ensureStateDir(cwd);
   const nextJobs = pruneJobs(state.jobs ?? []);
@@ -109,16 +169,23 @@ export function saveState(cwd, state) {
     }
     removeJobFile(resolveJobFile(cwd, job.id));
     removeFileIfExists(job.logFile);
+    removeFileIfExists(resolveJobInboxFile(cwd, job.id));
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  writeFileAtomic(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`);
   return nextState;
 }
 
+export function saveState(cwd, state) {
+  return withStateLock(cwd, () => saveStateUnlocked(cwd, state));
+}
+
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  return withStateLock(cwd, () => {
+    const state = loadState(cwd);
+    mutate(state);
+    return saveStateUnlocked(cwd, state);
+  });
 }
 
 export function generateJobId(prefix = "job") {
@@ -152,10 +219,13 @@ export function listJobs(cwd) {
 
 export function setConfig(cwd, key, value) {
   return updateState(cwd, (state) => {
-    state.config = {
-      ...state.config,
-      [key]: value
-    };
+    const nextConfig = { ...state.config };
+    if (value == null) {
+      delete nextConfig[key];
+    } else {
+      nextConfig[key] = value;
+    }
+    state.config = nextConfig;
   });
 }
 
@@ -163,10 +233,43 @@ export function getConfig(cwd) {
   return loadState(cwd).config;
 }
 
+// User-level defaults shared by every workspace (model, effort, sandbox, network).
+export function resolveGlobalConfigFile() {
+  if (process.env[GLOBAL_CONFIG_ENV]) {
+    return path.resolve(process.env[GLOBAL_CONFIG_ENV]);
+  }
+  const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+  return path.join(configHome, "codex-companion", "config.json");
+}
+
+export function getGlobalConfig() {
+  const configFile = resolveGlobalConfigFile();
+  if (!fs.existsSync(configFile)) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(configFile, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function setGlobalConfig(key, value) {
+  const nextConfig = { ...getGlobalConfig() };
+  if (value == null) {
+    delete nextConfig[key];
+  } else {
+    nextConfig[key] = value;
+  }
+  writeFileAtomic(resolveGlobalConfigFile(), `${JSON.stringify(nextConfig, null, 2)}\n`);
+  return nextConfig;
+}
+
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  writeFileAtomic(jobFile, `${JSON.stringify(payload, null, 2)}\n`);
   return jobFile;
 }
 
@@ -188,4 +291,44 @@ export function resolveJobLogFile(cwd, jobId) {
 export function resolveJobFile(cwd, jobId) {
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.json`);
+}
+
+export function resolveJobInboxFile(cwd, jobId) {
+  ensureStateDir(cwd);
+  return path.join(resolveJobsDir(cwd), `${jobId}.inbox.jsonl`);
+}
+
+// Job ids are unique across workspaces, so a job launched with --cwd <other>
+// can still be inspected, awaited or messaged from anywhere.
+export function findJobAcrossWorkspaces(jobId) {
+  if (!jobId) {
+    return null;
+  }
+  const roots = [...new Set([resolveStateRootDir(), FALLBACK_STATE_ROOT_DIR])];
+  for (const root of roots) {
+    let entries;
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      const jobFile = path.join(root, entry.name, JOBS_DIR_NAME, `${jobId}.json`);
+      if (!fs.existsSync(jobFile)) {
+        continue;
+      }
+      try {
+        const job = readJobFile(jobFile);
+        if (job?.workspaceRoot) {
+          return job;
+        }
+      } catch {
+        // A partially written or corrupt record is not a match.
+      }
+    }
+  }
+  return null;
 }

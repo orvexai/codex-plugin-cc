@@ -155,7 +155,10 @@ export async function runTrackedJob(job, runner, options = {}) {
     const execution = await runner();
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
+    // Merge over the stored record: the turn may have added fields while it
+    // ran (e.g. deliveredMessageIds from `send`) that the final write must keep.
     writeJobFile(job.workspaceRoot, job.id, {
+      ...(readStoredJobOrNull(job.workspaceRoot, job.id) ?? {}),
       ...runningRecord,
       status: completionStatus,
       threadId: execution.threadId ?? null,

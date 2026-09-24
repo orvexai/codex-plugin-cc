@@ -121,10 +121,37 @@ function appendActiveJobsTable(lines, jobs) {
   }
 }
 
+function formatRuntime(runtime) {
+  if (!runtime?.sandbox) {
+    return null;
+  }
+  const parts = [runtime.sandbox];
+  if (runtime.network) {
+    parts.push("network on");
+  }
+  if (runtime.model) {
+    parts.push(`model ${runtime.model}`);
+  }
+  if (runtime.effort) {
+    parts.push(`effort ${runtime.effort}`);
+  }
+  return parts.join(", ");
+}
+
 function pushJobDetails(lines, job, options = {}) {
   lines.push(`- ${formatJobLine(job)}`);
   if (job.summary) {
     lines.push(`  Summary: ${job.summary}`);
+  }
+  if (job.name) {
+    lines.push(`  Name: ${job.name}`);
+  }
+  const runtime = formatRuntime(job.runtime);
+  if (runtime) {
+    lines.push(`  Runtime: ${runtime}`);
+  }
+  if (job.parentJobId) {
+    lines.push(`  Follow-up to: ${job.parentJobId}`);
   }
   if (job.phase) {
     lines.push(`  Phase: ${job.phase}`);
@@ -189,6 +216,20 @@ export function renderSetupReport(report) {
     `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`,
     ""
   ];
+
+  if (report.defaults) {
+    const describe = (entry) => (entry?.value == null ? "(Codex default)" : `${entry.value} [${entry.source}]`);
+    lines.push("Task defaults:");
+    lines.push(`- model: ${describe(report.defaults.model)}`);
+    lines.push(`- effort: ${describe(report.defaults.effort)}`);
+    lines.push(`- sandbox: ${describe(report.defaults.sandbox)}`);
+    lines.push(`- network: ${describe(report.defaults.network)}`);
+    lines.push("");
+  }
+
+  if (report.cliShim) {
+    lines.push(`CLI shim: ${report.cliShim}`, "");
+  }
 
   if (report.actionsTaken.length > 0) {
     lines.push("Actions taken:");

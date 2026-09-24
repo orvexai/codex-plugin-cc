@@ -10,6 +10,7 @@ import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
+const MID_TURN_METHODS = new Set(["turn/steer"]);
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -215,7 +216,9 @@ async function main() {
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
           }
-          if (activeStreamSocket === socket && !isStreaming) {
+          // A failed mid-turn request (e.g. turn/steer) must not orphan the
+          // turn that this socket is still streaming.
+          if (activeStreamSocket === socket && !isStreaming && !MID_TURN_METHODS.has(message.method)) {
             activeStreamSocket = null;
           }
         }

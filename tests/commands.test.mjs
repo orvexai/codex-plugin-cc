@@ -78,9 +78,11 @@ test("continue is not exposed as a user-facing command", () => {
     "rescue.md",
     "result.md",
     "review.md",
+    "send.md",
     "setup.md",
     "status.md",
-    "transfer.md"
+    "transfer.md",
+    "wait.md"
   ]);
 });
 
@@ -154,7 +156,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
   assert.match(readme, /`codex:codex-rescue` subagent/i);
-  assert.match(readme, /if you do not pass `--model` or `--effort`, Codex chooses its own defaults/i);
+  assert.match(readme, /If you do not pass `--model` or `--effort` and have not set defaults, Codex chooses its own/i);
   assert.match(readme, /--model gpt-5\.4-mini --effort medium/i);
   assert.match(readme, /`spark`, the plugin maps that to `gpt-5\.3-codex-spark`/i);
   assert.match(readme, /continue a previous Codex task/i);
@@ -168,6 +170,12 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(readme, /### `\/codex:status`/);
   assert.match(readme, /### `\/codex:result`/);
   assert.match(readme, /### `\/codex:cancel`/);
+  assert.match(readme, /### `\/codex:send`/);
+  assert.match(readme, /### `\/codex:wait`/);
+  assert.match(readme, /claude plugin install codex@orvex-codex/);
+  assert.match(rescue, /`--sandbox <mode>`, `--full-access`, `--read-only`, `--network`, `--no-network` and `--name <label>` are runtime flags/);
+  assert.match(agent, /Treat `--sandbox <mode>`, `--full-access`, `--read-only`, `--network`, `--no-network` and `--name <label>` as runtime controls/);
+  assert.match(runtimeSkill, /pass them through to `task` unchanged/);
 });
 
 test("transfer, result, and cancel commands are exposed as deterministic runtime entrypoints", () => {
@@ -214,7 +222,7 @@ test("setup command can offer Codex install and still points users to codex logi
   const setup = read("commands/setup.md");
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
 
-  assert.match(setup, /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\]'/);
+  assert.match(setup, /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\]/);
   assert.match(setup, /AskUserQuestion/);
   assert.match(setup, /npm install -g @openai\/codex/);
   assert.match(setup, /codex-companion\.mjs" setup --json \$ARGUMENTS/);
