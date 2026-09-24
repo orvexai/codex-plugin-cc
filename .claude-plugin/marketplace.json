@@ -1,19 +1,20 @@
 {
-  "name": "openai-codex",
+  "name": "orvex-codex",
   "owner": {
-    "name": "OpenAI"
+    "name": "Orvex",
+    "url": "https://github.com/orvexai"
   },
   "metadata": {
-    "description": "Codex plugins to use in Claude Code for delegation and code review.",
-    "version": "1.0.6"
+    "description": "Orvex flavour of the Codex plugin for Claude Code: sandbox control, job messaging, parallel waits and defaults.",
+    "version": "1.0.6-orvex.1"
   },
   "plugins": [
     {
       "name": "codex",
-      "description": "Use Codex from Claude Code to review code or delegate tasks.",
-      "version": "1.0.6",
+      "description": "Use Codex from Claude Code to review code or delegate tasks (Orvex flavour).",
+      "version": "1.0.6-orvex.1",
       "author": {
-        "name": "OpenAI"
+        "name": "Orvex"
       },
       "source": "./plugins/codex"
     }

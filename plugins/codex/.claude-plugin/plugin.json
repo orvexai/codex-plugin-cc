@@ -1,8 +1,9 @@
 {
   "name": "codex",
-  "version": "1.0.6",
-  "description": "Use Codex from Claude Code to review code or delegate tasks.",
+  "version": "1.0.6-orvex.1",
+  "description": "Use Codex from Claude Code to review code or delegate tasks (Orvex flavour).",
   "author": {
-    "name": "OpenAI"
-  }
+    "name": "Orvex"
+  },
+  "homepage": "https://github.com/orvexai/codex-plugin-cc"
 }
