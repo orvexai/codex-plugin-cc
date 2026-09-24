@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { readJobFile, resolveJobFile, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -321,6 +322,40 @@ test("messages the turn never accepts are reported as undelivered, not lost", ()
   assert.equal(stored.result.undeliveredMessages.length, 1);
   assert.equal(stored.result.undeliveredMessages[0].id, delivery.messageId);
   assert.match(stored.result.undeliveredMessages[0].error, /transient steer failure/);
+});
+
+test("a steer request that never answers cannot keep a finished turn running", () => {
+  const ws = makeWorkspace("steer-hang");
+  const jobId = launchBackground(ws, ["job whose app-server ignores steering"]);
+
+  const sent = ws.companion(["send", jobId, "into the void", "--no-follow-up", "--timeout-ms", "30000", "--json"]);
+  assert.equal(sent.status, 0, sent.stderr);
+  const delivery = JSON.parse(sent.stdout);
+  assert.equal(delivery.status, "finished-undelivered");
+
+  const waited = ws.companion(["wait", jobId, "--timeout-ms", "20000", "--json"]);
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.equal(JSON.parse(waited.stdout).jobs[0].status, "completed");
+  assert.match(ws.companion(["result", jobId]).stdout, new RegExp(`Undelivered messages[\\s\\S]*${delivery.messageId}`));
+});
+
+test("send detects a message that arrived after the turn closed its inbox", () => {
+  const ws = makeWorkspace();
+  const task = ws.companion(["task", "finish quickly"]);
+  assert.equal(task.status, 0, task.stderr);
+  const finished = JSON.parse(ws.companion(["status", "--json"]).stdout).latestFinished;
+
+  // Recreate the window between the worker closing its inbox and the job
+  // being recorded as finished.
+  upsertJob(finished.workspaceRoot, { id: finished.id, status: "running", phase: "finalizing" });
+  const jobFile = resolveJobFile(finished.workspaceRoot, finished.id);
+  writeJobFile(finished.workspaceRoot, finished.id, { ...readJobFile(jobFile), status: "running" });
+
+  const started = Date.now();
+  const sent = ws.companion(["send", finished.id, "too late", "--no-follow-up", "--timeout-ms", "15000", "--json"]);
+  assert.equal(sent.status, 0, sent.stderr);
+  assert.equal(JSON.parse(sent.stdout).status, "finished-undelivered");
+  assert.ok(Date.now() - started < 5000, "send should notice the closed inbox instead of waiting out its timeout");
 });
 
 test("send rejects empty messages and unknown jobs", () => {

@@ -116,6 +116,35 @@ function readInboxEntries(inboxFile, offset) {
 }
 
 const MAX_STEER_ATTEMPTS = 3;
+const STEER_REQUEST_TIMEOUT_MS = 30000;
+const STEER_STOP_GRACE_MS = 5000;
+
+export function resolveClosedInboxFile(inboxFile) {
+  return `${inboxFile}.closed`;
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// Closes the inbox by renaming it: a `send` that appends afterwards writes a
+// fresh file nobody reads, and can tell from the closed file that it missed.
+function closeInbox(inboxFile) {
+  const closedFile = resolveClosedInboxFile(inboxFile);
+  try {
+    fs.renameSync(inboxFile, closedFile);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+    fs.writeFileSync(closedFile, "", "utf8");
+  }
+  return closedFile;
+}
 
 // Delivers messages that `send` appends to the job inbox into the active turn.
 // A message is only consumed once Codex accepts it; failures are retried in
@@ -142,11 +171,15 @@ function startInboxSteering(client, threadId, turnId, options = {}) {
       const message = entry.message;
       const label = message.id ? `message ${message.id}` : "message";
       try {
-        await client.request("turn/steer", {
-          threadId,
-          expectedTurnId: turnId,
-          input: buildTurnInput(message.text)
-        });
+        await withTimeout(
+          client.request("turn/steer", {
+            threadId,
+            expectedTurnId: turnId,
+            input: buildTurnInput(message.text)
+          }),
+          options.steerTimeoutMs ?? STEER_REQUEST_TIMEOUT_MS,
+          "turn/steer did not answer in time"
+        );
         offset = entry.end;
         emitProgress(options.onProgress, `Delivered ${label} to the running turn.`, null, { threadId, turnId });
         options.onSteered?.(message);
@@ -186,9 +219,11 @@ function startInboxSteering(client, threadId, turnId, options = {}) {
       stopped = true;
       clearInterval(timer);
       if (inFlight) {
-        await inFlight;
+        // Never let a stalled steer keep a finished turn from completing.
+        await Promise.race([inFlight, new Promise((resolve) => setTimeout(resolve, STEER_STOP_GRACE_MS))]);
       }
-      const pending = readInboxEntries(options.inboxFile, offset)
+      const closedFile = closeInbox(options.inboxFile);
+      const pending = readInboxEntries(closedFile, offset)
         .map((entry) => entry.message)
         .filter(Boolean);
       return [...abandoned, ...pending];

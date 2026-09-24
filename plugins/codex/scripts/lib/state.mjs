@@ -118,6 +118,26 @@ function removeLockIfOwnedBy(lockFile, token) {
   }
 }
 
+// Reclaims a dead owner's lock by renaming it aside first, so only one
+// recovering process can claim it, then checks that the claimed file is the
+// same dead lock. A live lock taken in the meantime is put back untouched.
+function reclaimStaleLock(lockFile, staleToken) {
+  const claimed = `${lockFile}.reclaim-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    fs.renameSync(lockFile, claimed);
+  } catch {
+    return;
+  }
+  if (String(readLockOwner(claimed)?.token ?? "") !== staleToken) {
+    try {
+      fs.linkSync(claimed, lockFile);
+    } catch {
+      // Another process acquired the lock meanwhile; it is the owner now.
+    }
+  }
+  fs.rmSync(claimed, { force: true });
+}
+
 // Serialises read-modify-write cycles on state.json across processes. Parallel
 // background jobs in one workspace otherwise overwrite each other's updates.
 // The lock records its owner so it is only ever broken when the owner is dead,
@@ -142,7 +162,7 @@ function withStateLock(cwd, fn) {
       }
       const staleToken = findStaleLockToken(lockFile);
       if (staleToken !== null) {
-        removeLockIfOwnedBy(lockFile, staleToken);
+        reclaimStaleLock(lockFile, staleToken);
         continue;
       }
       if (Date.now() > deadline) {
@@ -214,6 +234,7 @@ function saveStateUnlocked(cwd, state) {
     removeJobFile(resolveJobFile(cwd, job.id));
     removeFileIfExists(job.logFile);
     removeFileIfExists(resolveJobInboxFile(cwd, job.id));
+    removeFileIfExists(`${resolveJobInboxFile(cwd, job.id)}.closed`);
   }
 
   writeFileAtomic(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`);

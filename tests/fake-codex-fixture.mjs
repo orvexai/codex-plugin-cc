@@ -606,6 +606,8 @@ rl.on("line", (line) => {
 
 	        if (BEHAVIOR === "steer-rejected") {
 	          emitTurnCompletedLater(thread.id, turnId, items, 2000);
+	        } else if (BEHAVIOR === "steer-hang") {
+	          emitTurnCompletedLater(thread.id, turnId, items, 1500);
 	        } else if (BEHAVIOR === "steerable-task" || BEHAVIOR === "steer-flaky") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {
@@ -657,6 +659,11 @@ rl.on("line", (line) => {
 	      }
 
 	      case "turn/steer": {
+	        if (BEHAVIOR === "steer-hang") {
+	          state.steerAttempts = (state.steerAttempts || 0) + 1;
+	          saveState(state);
+	          break;
+	        }
 	        const steerText = (message.params.input || [])
 	          .filter((item) => item.type === "text")
 	          .map((item) => item.text)

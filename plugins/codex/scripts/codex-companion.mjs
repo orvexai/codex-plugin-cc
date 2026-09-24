@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import {
     buildPersistentTaskThreadName,
+    resolveClosedInboxFile,
     DEFAULT_CONTINUE_PROMPT,
     findLatestTaskThread,
     getCodexAuthStatus,
@@ -1068,9 +1069,20 @@ async function handleTask(argv) {
   );
 }
 
+// True once the worker has closed the inbox without ever reading `messageId`,
+// i.e. the message was appended after the turn stopped listening.
+function missedClosedInbox(inboxFile, messageId) {
+  const closedFile = resolveClosedInboxFile(inboxFile);
+  if (!fs.existsSync(closedFile)) {
+    return false;
+  }
+  return !fs.readFileSync(closedFile, "utf8").includes(`"id":"${messageId}"`);
+}
+
 async function deliverToRunningJob(workspaceRoot, job, text, timeoutMs) {
   const message = { id: generateJobId("msg"), text, createdAt: nowIso() };
-  fs.appendFileSync(resolveJobInboxFile(workspaceRoot, job.id), `${JSON.stringify(message)}\n`, "utf8");
+  const inboxFile = resolveJobInboxFile(workspaceRoot, job.id);
+  fs.appendFileSync(inboxFile, `${JSON.stringify(message)}\n`, "utf8");
   appendLogLine(job.logFile, `Queued ${message.id} for the running turn.`);
 
   const deadline = Date.now() + timeoutMs;
@@ -1081,6 +1093,9 @@ async function deliverToRunningJob(workspaceRoot, job, text, timeoutMs) {
     }
     if (current && !isActiveJobStatus(current.status)) {
       return { status: "finished-undelivered", jobId: job.id, messageId: message.id, jobStatus: current.status };
+    }
+    if (missedClosedInbox(inboxFile, message.id)) {
+      return { status: "finished-undelivered", jobId: job.id, messageId: message.id, jobStatus: "finishing" };
     }
     if (Date.now() >= deadline) {
       return { status: "queued", jobId: job.id, messageId: message.id };
