@@ -118,3 +118,51 @@ test("state updates break a lock whose owner process has exited", () => {
   assert.equal(fs.existsSync(lockFile), false);
   assert.equal(listJobs(workspace)[0].id, "job-after-stale-lock");
 });
+
+function withLockTimeout(ms, fn) {
+  const previous = process.env.CODEX_COMPANION_LOCK_TIMEOUT_MS;
+  process.env.CODEX_COMPANION_LOCK_TIMEOUT_MS = String(ms);
+  try {
+    return fn();
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CODEX_COMPANION_LOCK_TIMEOUT_MS;
+    } else {
+      process.env.CODEX_COMPANION_LOCK_TIMEOUT_MS = previous;
+    }
+  }
+}
+
+test("state updates never break a lock whose owner is still alive", () => {
+  const workspace = makeTempDir();
+  const lockFile = path.join(resolveStateDir(workspace), "state.lock");
+  fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+  const liveLock = JSON.stringify({ pid: process.pid, token: "live-owner", createdAt: new Date().toISOString() });
+  fs.writeFileSync(lockFile, liveLock);
+
+  withLockTimeout(300, () => {
+    assert.throws(() => upsertJob(workspace, { id: "blocked", status: "queued" }), /Timed out waiting for the Codex companion state lock/);
+  });
+  assert.equal(fs.readFileSync(lockFile, "utf8"), liveLock);
+});
+
+test("stale-lock reclamation waits for a live reclaimer and clears an abandoned one", () => {
+  const workspace = makeTempDir();
+  const lockFile = path.join(resolveStateDir(workspace), "state.lock");
+  const guardFile = `${lockFile}.reclaim`;
+  fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+  const exited = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: exited.pid, token: "dead-owner", createdAt: new Date().toISOString() }));
+
+  fs.writeFileSync(guardFile, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
+  withLockTimeout(300, () => {
+    assert.throws(() => upsertJob(workspace, { id: "waits-for-reclaimer", status: "queued" }), /Timed out/);
+  });
+  assert.equal(fs.existsSync(lockFile), true);
+
+  fs.writeFileSync(guardFile, JSON.stringify({ pid: exited.pid, createdAt: new Date().toISOString() }));
+  upsertJob(workspace, { id: "after-abandoned-reclaimer", status: "queued" });
+  assert.equal(fs.existsSync(lockFile), false);
+  assert.equal(fs.existsSync(guardFile), false);
+  assert.equal(listJobs(workspace)[0].id, "after-abandoned-reclaimer");
+});

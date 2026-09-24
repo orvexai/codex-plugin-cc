@@ -118,24 +118,45 @@ function removeLockIfOwnedBy(lockFile, token) {
   }
 }
 
-// Reclaims a dead owner's lock by renaming it aside first, so only one
-// recovering process can claim it, then checks that the claimed file is the
-// same dead lock. A live lock taken in the meantime is put back untouched.
-function reclaimStaleLock(lockFile, staleToken) {
-  const claimed = `${lockFile}.reclaim-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+function lockFileAgeMs(filePath) {
   try {
-    fs.renameSync(lockFile, claimed);
+    return Date.now() - fs.statSync(filePath).mtimeMs;
   } catch {
-    return;
+    return 0;
   }
-  if (String(readLockOwner(claimed)?.token ?? "") !== staleToken) {
-    try {
-      fs.linkSync(claimed, lockFile);
-    } catch {
-      // Another process acquired the lock meanwhile; it is the owner now.
+}
+
+// Reclaims a dead owner's lock. Reclaimers serialise on a guard file and
+// re-check the lock under it: while the stale lock exists nobody can acquire a
+// new one, and no other reclaimer can act, so the lock removed here is always
+// the dead owner's and never a live replacement.
+function reclaimStaleLock(lockFile, staleToken) {
+  const guardFile = `${lockFile}.reclaim`;
+  let guard;
+  try {
+    guard = fs.openSync(guardFile, "wx");
+  } catch (error) {
+    if (error?.code !== "EEXIST") {
+      throw error;
     }
+    const guardOwner = readLockOwner(guardFile);
+    const abandoned = guardOwner?.pid ? !isProcessAlive(guardOwner.pid) : lockFileAgeMs(guardFile) > LOCK_STALE_MS;
+    if (abandoned) {
+      fs.rmSync(guardFile, { force: true });
+    }
+    return false;
   }
-  fs.rmSync(claimed, { force: true });
+  try {
+    fs.writeSync(guard, JSON.stringify({ pid: process.pid, createdAt: nowIso() }));
+    if (findStaleLockToken(lockFile) === staleToken) {
+      fs.rmSync(lockFile, { force: true });
+      return true;
+    }
+    return false;
+  } finally {
+    fs.closeSync(guard);
+    fs.rmSync(guardFile, { force: true });
+  }
 }
 
 // Serialises read-modify-write cycles on state.json across processes. Parallel
@@ -146,7 +167,8 @@ function withStateLock(cwd, fn) {
   ensureStateDir(cwd);
   const lockFile = path.join(resolveStateDir(cwd), LOCK_FILE_NAME);
   const token = `${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  const timeoutMs = Number(process.env.CODEX_COMPANION_LOCK_TIMEOUT_MS) || LOCK_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
       const fd = fs.openSync(lockFile, "wx");
@@ -161,10 +183,10 @@ function withStateLock(cwd, fn) {
         throw error;
       }
       const staleToken = findStaleLockToken(lockFile);
-      if (staleToken !== null) {
-        reclaimStaleLock(lockFile, staleToken);
+      if (staleToken !== null && reclaimStaleLock(lockFile, staleToken)) {
         continue;
       }
+      // Waiting on a live owner, or on another process's reclaim: back off.
       if (Date.now() > deadline) {
         throw new Error(`Timed out waiting for the Codex companion state lock at ${lockFile}.`);
       }
