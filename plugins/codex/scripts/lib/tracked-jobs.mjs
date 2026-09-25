@@ -69,6 +69,8 @@ export function createJobRecord(base, options = {}) {
     ...base,
     schemaVersion: 2,
     createdAt: nowIso(),
+    ...(base.owner ? { owner: { ...base.owner } } : {}),
+    ...(base.onOwnerExit ? { onOwnerExit: base.onOwnerExit } : {}),
     ...(sessionId ? { sessionId } : {})
   };
 }
@@ -202,7 +204,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       turnId: execution.turnId ?? null,
       pid: null,
       worker: { ...worker, ...stored?.worker, pid: null },
-      phase: completionStatus === "completed" ? "done" : "failed",
+      phase: completionStatus === "completed" ? "done" : completionStatus === "cancelled" ? "cancelled" : "failed",
       ...(controlledCancel ? { phase: "cancelled", cancelReason: controlledCancel.reason || "user", cancel: { ...(stored?.cancel ?? {}), reason: controlledCancel.reason || "user", interruptDelivered: Boolean(controlledCancel.interruptDelivered), turnConfirmedStopped: Boolean(controlledCancel.turnConfirmedStopped) } } : {}),
       completedAt,
       result: execution.payload,

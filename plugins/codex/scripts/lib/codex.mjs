@@ -42,8 +42,10 @@ import path from "node:path";
 import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
+import { readJobFile, resolveJobFile } from "./state.mjs";
 import { binaryAvailable, readProcessStartTime } from "./process.mjs";
-import { ackControlOp, readControlAck, readControlOps } from "./control-channel.mjs";
+import { ackControlOp, appendControlOp, readControlAck, readControlOps } from "./control-channel.mjs";
+import { assessOwner } from "./job-liveness.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
@@ -1160,6 +1162,18 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId, brokerEndp
   }
 }
 
+export async function markBrokerThreadDetached(cwd, { threadId, brokerEndpoint }) {
+  if (!threadId || !brokerEndpoint) return false;
+  let client;
+  try {
+    client = await CodexAppServerClient.connect(cwd, { brokerEndpoint, noSpawn: true, reuseExistingBroker: true });
+    await client.request("broker/markDetached", { threadId });
+    return true;
+  } finally {
+    await client?.close().catch(() => {});
+  }
+}
+
 export async function waitForAppServerThreadStop(cwd, { threadId, brokerEndpoint, timeoutMs = 0 }) {
   if (!threadId || !brokerEndpoint) return { confirmed: false, detail: "broker-not-found" };
   let client;
@@ -1357,6 +1371,14 @@ export async function runAppServerTurn(cwd, options = {}) {
       threadId
     });
 
+    const latestJob = options.workspaceRoot && options.jobId
+      ? readJobFile(resolveJobFile(options.workspaceRoot, options.jobId))
+      : null;
+    const brokerDetached = options.brokerDetached || latestJob?.owner?.brokerDetached === true;
+    if (brokerDetached && client.transport === "broker") {
+      await client.request("broker/markDetached", { threadId });
+    }
+
     const preTurnOp = alreadyControlled();
     if (preTurnOp) return { status: 0, cancelledByControl: preTurnOp, threadId, turnId: null, finalMessage: "", reasoningSummary: [], touchedFiles: [], commandExecutions: [] };
 
@@ -1380,7 +1402,8 @@ export async function runAppServerTurn(cwd, options = {}) {
             input: buildTurnInput(prompt),
             model: options.model ?? null,
             effort: options.effort ?? null,
-            outputSchema: options.outputSchema ?? null
+            outputSchema: options.outputSchema ?? null,
+            ...(brokerDetached ? { brokerDetached: true } : {})
           }),
         {
           onProgress: options.onProgress,
@@ -1426,8 +1449,34 @@ export async function runAppServerTurn(cwd, options = {}) {
 function startControlPoller(client, threadId, turnId, options) {
   let offset = 0;
   let inFlight = false;
+  let ownerCheckInFlight = false;
   let stopped = false;
   let pending = null;
+  let ownerCancelQueued = false;
+  const checkOwner = async () => {
+    if (ownerCheckInFlight || stopped || pending || ownerCancelQueued) return;
+    ownerCheckInFlight = true;
+    try {
+      const currentJob = options.workspaceRoot && options.jobId ? readJobFile(resolveJobFile(options.workspaceRoot, options.jobId)) : null;
+      const currentOwner = currentJob?.owner ?? options.owner;
+      const ownerExitPolicy = currentJob?.onOwnerExit ?? options.onOwnerExit;
+      if (currentOwner && ownerExitPolicy === "cancel") {
+        const ownerState = assessOwner(options.workspaceRoot, { id: options.jobId, owner: currentOwner });
+        if (!ownerState.alive) {
+          appendControlOp(options.workspaceRoot, options.jobId, { op: "cancel", reason: "owner-lost" });
+          ownerCancelQueued = true;
+          void tick();
+          if (options.logFile) {
+            try { fs.appendFileSync(options.logFile, `[${new Date().toISOString()}] owner exited; cancelling\n`); } catch { /* A logging failure must not block cancellation. */ }
+          }
+        }
+      }
+    } catch (error) {
+      if (options.logFile) {
+        try { fs.appendFileSync(options.logFile, `[${new Date().toISOString()}] owner check failed: ${error.message}\n`); } catch { /* Best-effort diagnostic only. */ }
+      }
+    } finally { ownerCheckInFlight = false; }
+  };
   const tick = async () => {
     if (inFlight || stopped || pending) return;
     inFlight = true;
@@ -1444,8 +1493,13 @@ function startControlPoller(client, threadId, turnId, options) {
       }
     } finally { inFlight = false; }
   };
-  const timer = setInterval(() => { void tick(); }, Number(process.env.CODEX_COMPANION_CONTROL_POLL_MS) || 100);
-  timer.unref?.();
+  const controlTimer = setInterval(() => { void tick(); }, Number(process.env.CODEX_COMPANION_CONTROL_POLL_MS) || 100);
+  const ownerTimer = options.workspaceRoot && options.jobId
+    ? setInterval(() => { void checkOwner().catch(() => {}); }, Number(process.env.CODEX_COMPANION_OWNER_POLL_MS) || 2000)
+    : null;
+  controlTimer.unref?.();
+  ownerTimer?.unref?.();
+  void checkOwner().catch(() => {});
   void tick();
   return {
     async stop(state) {
@@ -1457,7 +1511,8 @@ function startControlPoller(client, threadId, turnId, options) {
         while (!pending && state && Date.now() < deadline && !state.completed) await new Promise((resolve) => setTimeout(resolve, 20));
       } finally {
         stopped = true;
-        clearInterval(timer);
+        clearInterval(controlTimer);
+        if (ownerTimer) clearInterval(ownerTimer);
       }
       if (!pending) return null;
       const turnConfirmedStopped = state?.finalTurn?.status !== "inProgress" && state?.completed === true;

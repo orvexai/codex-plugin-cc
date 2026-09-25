@@ -35,7 +35,7 @@ function send(socket, message) {
 }
 
 function isInterruptRequest(message) {
-  return message?.method === "turn/interrupt";
+  return message?.method === "turn/interrupt" || message?.method === "broker/markDetached";
 }
 
 function writePidFile(pidFile) {
@@ -70,7 +70,11 @@ async function main() {
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
+  let activeTurn = null;
+  let disconnectingTurnId = null;
+  const detachedThreads = new Set();
   const sockets = new Set();
+  const closedSockets = new WeakSet();
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -79,7 +83,28 @@ async function main() {
     if (activeStreamSocket === socket) {
       activeStreamSocket = null;
       activeStreamThreadIds = null;
+      activeTurn = null;
     }
+  }
+
+  async function interruptTurn(turn) {
+    if (!turn || detachedThreads.has(turn.threadId)) return;
+    const key = `${turn.threadId}/${turn.turnId}`;
+    if (disconnectingTurnId === key) return;
+    disconnectingTurnId = key;
+    try {
+      await appClient.request("turn/interrupt", turn);
+      process.stderr.write(`Interrupted broker turn ${turn.threadId}/${turn.turnId} after owner disconnect.\n`);
+    } catch (error) {
+      process.stderr.write(`Could not interrupt broker turn ${turn.threadId}/${turn.turnId} after owner disconnect: ${error.message}\n`);
+    } finally {
+      if (disconnectingTurnId === key) disconnectingTurnId = null;
+    }
+  }
+
+  async function interruptDisconnectedTurn(socket) {
+    if (activeStreamSocket !== socket || !activeTurn) return;
+    await interruptTurn(activeTurn);
   }
 
   function routeNotification(message) {
@@ -88,8 +113,15 @@ async function main() {
       return;
     }
     send(target, message);
+    if (message.method === "turn/started" && activeStreamSocket === target) {
+      const threadId = message.params?.threadId;
+      const turnId = message.params?.turn?.id;
+      if (threadId && turnId) activeTurn = { threadId, turnId };
+    }
     if (message.method === "turn/completed" && activeStreamSocket === target) {
       const threadId = message.params?.threadId ?? null;
+      if (threadId) detachedThreads.delete(threadId);
+      if (!threadId || activeTurn?.threadId === threadId) activeTurn = null;
       if (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId)) {
         activeStreamSocket = null;
         activeStreamThreadIds = null;
@@ -168,6 +200,13 @@ async function main() {
           continue;
         }
 
+        if (message.method === "broker/markDetached") {
+          const threadId = message.params?.threadId;
+          if (threadId) detachedThreads.add(threadId);
+          send(socket, { id: message.id, result: {} });
+          continue;
+        }
+
         const allowInterruptDuringActiveStream =
           isInterruptRequest(message) && activeStreamSocket && activeStreamSocket !== socket && !activeRequestSocket;
 
@@ -196,14 +235,31 @@ async function main() {
         }
 
         const isStreaming = STREAMING_METHODS.has(message.method);
+        const brokerDetached = message.method === "turn/start" && message.params?.brokerDetached === true;
+        const forwardedParams = { ...(message.params ?? {}) };
+        delete forwardedParams.brokerDetached;
         activeRequestSocket = socket;
 
         try {
-          const result = await appClient.request(message.method, message.params ?? {});
+          const result = await appClient.request(message.method, forwardedParams);
           send(socket, { id: message.id, result });
           if (isStreaming) {
-            activeStreamSocket = socket;
-            activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+            if (message.method === "turn/start") {
+              const threadId = message.params?.threadId;
+              const turnId = result?.turn?.id ?? null;
+              if (brokerDetached && threadId) detachedThreads.add(threadId);
+              const turn = threadId && turnId ? { threadId, turnId } : null;
+              if (closedSockets.has(socket) || socket.destroyed) {
+                await interruptTurn(turn);
+              } else {
+                activeStreamSocket = socket;
+                activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+                activeTurn = turn;
+              }
+            } else {
+              activeStreamSocket = socket;
+              activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+            }
           }
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
@@ -227,12 +283,14 @@ async function main() {
 
     socket.on("close", () => {
       sockets.delete(socket);
-      clearSocketOwnership(socket);
+      closedSockets.add(socket);
+      void interruptDisconnectedTurn(socket).finally(() => clearSocketOwnership(socket));
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
-      clearSocketOwnership(socket);
+      closedSockets.add(socket);
+      void interruptDisconnectedTurn(socket).finally(() => clearSocketOwnership(socket));
     });
   });
 

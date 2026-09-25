@@ -5,7 +5,7 @@ import { getSessionRuntimeStatus } from "./codex.mjs";
 import { findJobAcrossWorkspaces, getConfig, isSafeJobId, listJobs, readJobFile, resolveJobFile, resolveJobsDir, upsertJob } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
-import { reconcileJob, assessJobLiveness } from "./job-liveness.mjs";
+import { reconcileJob, assessJobLiveness, assessOwner } from "./job-liveness.mjs";
 import { isActiveJobStatus, TERMINAL_STATUSES } from "./exit-codes.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
@@ -179,12 +179,16 @@ export function enrichJob(job, options = {}) {
 
   const workspaceRoot = job.workspaceRoot;
   const liveness = workspaceRoot ? assessJobLiveness(workspaceRoot, job) : { heartbeatAgeSec: null };
+  const ownerState = workspaceRoot ? assessOwner(workspaceRoot, job) : { alive: false };
   const stderrFile = job.worker?.stderrFile;
   const stderrPresent = stderrFile && fs.existsSync(stderrFile) && fs.statSync(stderrFile).size > 0;
   if (job.status === "lost" && stderrPresent) finalJob.progressPreview = [`Worker stderr: ${stderrFile}`];
   Object.assign(finalJob, {
     phase: finalJob.phase ?? inferLegacyJobPhase(finalJob, finalJob.progressPreview),
     heartbeatAgeSec: liveness.heartbeatAgeSec,
+    owner: job.owner ?? null,
+    ownerAlive: ownerState.alive,
+    orphaned: isActiveJobStatus(job.status) && job.owner != null && !ownerState.alive && job.owner.kind !== "detached",
     worker: { ...(job.worker ?? {}), ...(stderrPresent ? { stderrFile } : { stderrFile: undefined }) }
   });
   if (job.status === "lost" && stderrPresent) finalJob.errorMessage = `${job.errorMessage ?? "worker exited without completion record"} Worker stderr: ${stderrFile}`;
