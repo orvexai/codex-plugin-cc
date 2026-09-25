@@ -4,6 +4,13 @@ import process from "node:process";
 
 export function isProcessAlive(pid) {
   if (!Number.isInteger(Number(pid)) || Number(pid) <= 0) return false;
+  if (process.platform === "linux") {
+    try {
+      const stat = fs.readFileSync(`/proc/${Number(pid)}/stat`, "utf8");
+      const end = stat.lastIndexOf(")");
+      if (stat.slice(end + 1).trim().split(/\s+/)[0] === "Z") return false;
+    } catch { /* Fall back to kill(pid, 0) when procfs is unavailable. */ }
+  }
   try { process.kill(Number(pid), 0); return true; } catch (error) { return error?.code === "EPERM"; }
 }
 
@@ -29,6 +36,34 @@ export function isSameProcess({ pid, startTime }) {
   if (!isProcessAlive(Number(pid))) return false;
   const current = readProcessStartTime(pid);
   return !(startTime != null && current != null && String(startTime) !== String(current));
+}
+
+export async function terminateProcessTreeVerified(pid, { group = false, graceMs = 1000, killWaitMs = 5000 } = {}) {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) {
+    return { delivered: false, exited: true, escalated: false, residualPids: [] };
+  }
+  const startTime = readProcessStartTime(numericPid);
+  const same = () => isSameProcess({ pid: numericPid, startTime });
+  const signal = (name) => {
+    try { process.kill(group ? -numericPid : numericPid, name); return true; }
+    catch (error) { return error?.code !== "ESRCH" ? false : false; }
+  };
+  if (!same()) return { delivered: false, exited: true, escalated: false, residualPids: [] };
+  const delivered = signal("SIGTERM");
+  const wait = async (ms) => {
+    const until = Date.now() + Math.max(0, ms);
+    while (same() && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, Math.min(25, until - Date.now())));
+    return !same();
+  };
+  let exited = await wait(graceMs);
+  let escalated = false;
+  if (!exited) {
+    escalated = true;
+    signal("SIGKILL");
+    exited = await wait(killWaitMs);
+  }
+  return { delivered, exited, escalated, residualPids: exited ? [] : [numericPid] };
 }
 
 export function runCommand(command, args = [], options = {}) {

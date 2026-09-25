@@ -16,6 +16,7 @@ import {
     getSessionRuntimeStatus,
     importExternalAgentSession,
     interruptAppServerTurn,
+    waitForAppServerThreadStop,
     parseStructuredOutput,
     readOutputSchema,
     runAppServerReview,
@@ -24,9 +25,10 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, isSameProcess, terminateProcessTree, terminateProcessTreeVerified } from "./lib/process.mjs";
 import { EXIT, exitCodeForJob, isActiveJobStatus } from "./lib/exit-codes.mjs";
-import { reconcileJob } from "./lib/job-liveness.mjs";
+import { reconcileJob, reconcileJobDeep } from "./lib/job-liveness.mjs";
+import { ackControlOp, appendControlOp, readControlAck, resolveControlFile, waitForControlAck } from "./lib/control-channel.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -38,6 +40,7 @@ import {
   setConfig,
   setGlobalConfig,
   upsertJob,
+  upsertJobRecord,
   writeJobFile,
   markResultRead
 } from "./lib/state.mjs";
@@ -561,11 +564,11 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
   const timeoutMs = Math.max(0, Number(options.timeoutMs) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
   const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
   const deadline = Date.now() + timeoutMs;
-  let snapshot = buildSingleJobSnapshot(cwd, reference);
+  let snapshot = await buildSingleJobSnapshotDeep(cwd, reference);
 
   while (isActiveJobStatus(snapshot.job.status) && Date.now() < deadline) {
     await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
-    snapshot = buildSingleJobSnapshot(cwd, reference);
+    snapshot = await buildSingleJobSnapshotDeep(cwd, reference);
   }
 
   return {
@@ -573,6 +576,17 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
     waitTimedOut: isActiveJobStatus(snapshot.job.status),
     timeoutMs
   };
+}
+
+async function buildSingleJobSnapshotDeep(cwd, reference) {
+  let snapshot = buildSingleJobSnapshot(cwd, reference);
+  const stored = readStoredJob(snapshot.workspaceRoot, snapshot.job.id);
+  if (stored && ["lost", "orphaned", "running", "queued"].includes(stored.status)) {
+    await reconcileJobDeep(snapshot.workspaceRoot, stored);
+    const latest = readStoredJob(snapshot.workspaceRoot, snapshot.job.id);
+    if (latest && latest.status !== stored.status) snapshot = buildSingleJobSnapshot(cwd, reference);
+  }
+  return snapshot;
 }
 
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
@@ -750,6 +764,12 @@ async function executeTaskRun(request) {
     sandbox,
     config: buildSandboxConfig(request.network),
     inboxFile: request.jobId ? resolveJobInboxFile(workspaceRoot, request.jobId) : null,
+    controlFile: request.jobId ? resolveControlFile(workspaceRoot, request.jobId) : null,
+    workspaceRoot,
+    jobId: request.jobId ?? null,
+    onTransport: (transport) => {
+      if (request.jobId) upsertJobRecord(workspaceRoot, request.jobId, (stored) => ({ ...stored, ...transport, workerStartTime: stored?.worker?.startTime ?? null }));
+    },
     onSteered: (message) => recordDeliveredMessage(workspaceRoot, request.jobId, message.id),
     onProgress: request.onProgress,
     persistThread: true,
@@ -789,6 +809,7 @@ async function executeTaskRun(request) {
     exitStatus: result.status,
     threadId: result.threadId,
     turnId: result.turnId,
+    cancelledByControl: result.cancelledByControl ?? null,
     payload,
     rendered,
     summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
@@ -1181,8 +1202,9 @@ async function handleSend(argv) {
     throw new Error(`Job ${job.id} is a ${job.kindLabel ?? job.jobClass} job; only task jobs accept messages.`);
   }
 
-  if (job.status === "lost" && options["no-follow-up"]) {
-    outputCommandResult({ status: "lost", jobId: job.id }, `${job.id} is lost.\n`, options.json);
+  if (["lost", "orphaned"].includes(job.status) && options["no-follow-up"]) {
+    outputCommandResult({ status: job.status, jobId: job.id }, `${job.id} is ${job.status}.\n`, options.json);
+    process.exitCode = EXIT.LOST;
     return;
   }
 
@@ -1288,15 +1310,19 @@ async function handleWait(argv) {
     return;
   }
 
-  const snapshotAll = () => references.map((reference) => buildSingleJobSnapshot(cwd, reference).job);
+  const snapshotAll = async () => {
+    const out = [];
+    for (const reference of references) out.push((await buildSingleJobSnapshotDeep(cwd, reference)).job);
+    return out;
+  };
   const isSettled = (jobs) =>
     options.any ? jobs.some((job) => !isActiveJobStatus(job.status)) : jobs.every((job) => !isActiveJobStatus(job.status));
 
   const deadline = Date.now() + timeoutMs;
-  let jobs = snapshotAll();
+  let jobs = await snapshotAll();
   while (!isSettled(jobs) && Date.now() < deadline) {
     await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
-    jobs = snapshotAll();
+    jobs = await snapshotAll();
   }
 
   const timedOut = !isSettled(jobs);
@@ -1373,11 +1399,26 @@ async function handleTaskWorker(argv) {
       { ...storedJob, workspaceRoot },
       { logFile: storedJob.logFile ?? null }
     );
+    const signalHandlers = [];
+    let hardExitTimer = null;
+    for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+      const handler = () => {
+        try { appendControlOp(workspaceRoot, storedJob.id, { op: "cancel", reason: "worker-signal" }); } catch { /* best effort */ }
+        if (!hardExitTimer) {
+          hardExitTimer = setTimeout(() => process.exit(1), Number(process.env.CODEX_COMPANION_CANCEL_GRACE_MS) || 10000);
+          hardExitTimer.unref?.();
+        }
+      };
+      process.on(signal, handler);
+      signalHandlers.push([signal, handler]);
+    }
     await runTrackedJob(
       { ...storedJob, workspaceRoot, logFile },
       () => executeTaskRun({ ...request, onProgress: progress }),
       { logFile }
     );
+    if (hardExitTimer) clearTimeout(hardExitTimer);
+    for (const [signal, handler] of signalHandlers) process.off(signal, handler);
   } catch (error) {
     const stderrFile = path.join(path.dirname(resolveJobFile(workspaceRoot, options["job-id"])), `${options["job-id"]}.worker.err`);
     fs.appendFileSync(stderrFile, `${error instanceof Error ? error.stack : String(error)}\n`);
@@ -1401,7 +1442,7 @@ async function handleStatus(argv) {
           timeoutMs: options["timeout-ms"],
           pollIntervalMs: options["poll-interval-ms"]
         })
-      : buildSingleJobSnapshot(cwd, reference);
+      : await buildSingleJobSnapshotDeep(cwd, reference);
     outputCommandResult(snapshot, renderJobStatusReport(snapshot.job), options.json);
     return;
   }
@@ -1503,65 +1544,132 @@ function handleTaskResumeCandidate(argv) {
 
 async function handleCancel(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
-    booleanOptions: ["json"]
+    valueOptions: ["cwd", "grace-ms"],
+    booleanOptions: ["json", "force"]
   });
 
   if (printHelpIfRequested(options, "cancel")) return;
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
-  const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
+  let resolved;
+  try {
+    resolved = resolveCancelableJob(cwd, reference, { env: process.env });
+  } catch (error) {
+    const workspaceRoot = resolveWorkspaceRoot(cwd);
+    const terminal = reference ? readStoredJob(workspaceRoot, reference) : null;
+    if (!terminal || !["completed", "failed", "cancelled", "cancel-failed", "interrupted", "timed-out", "lost", "orphaned"].includes(terminal.status)) throw error;
+    if (["lost", "orphaned"].includes(terminal.status)) {
+      resolved = { workspaceRoot, job: terminal };
+    } else {
+      outputCommandResult({ jobId: terminal.id, status: terminal.status, title: terminal.title, cancel: terminal.cancel ?? null }, renderCancelReport(terminal), options.json);
+      return;
+    }
+  }
+  const { workspaceRoot, job } = resolved;
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
-  const threadId = existing.threadId ?? job.threadId ?? null;
-  const turnId = existing.turnId ?? job.turnId ?? null;
-
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
-  if (interrupt.attempted) {
-    appendLogLine(
-      job.logFile,
-      interrupt.interrupted
-        ? `Requested Codex turn interrupt for ${turnId} on ${threadId}.`
-        : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
-    );
+  const terminal = ["completed", "failed", "cancelled", "cancel-failed", "interrupted", "timed-out"].includes(existing.status ?? job.status);
+  if (terminal) {
+    const payload = { jobId: job.id, status: existing.status ?? job.status, title: job.title, cancel: existing.cancel ?? null };
+    outputCommandResult(payload, renderCancelReport({ ...job, ...existing }), options.json);
+    return;
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
-  appendLogLine(job.logFile, "Cancelled by user.");
+  const requestedAt = nowIso();
+  const op = appendControlOp(workspaceRoot, job.id, { op: "cancel", reason: "user" });
+  const worker = existing.worker ?? job.worker ?? {};
+  const workerPid = Number(worker.pid ?? existing.pid ?? job.pid);
+  const workerAlive = isSameProcess({ pid: workerPid, startTime: worker.startTime ?? null });
+  const ackTimeout = Number(process.env.CODEX_COMPANION_CONTROL_ACK_MS) || 3000;
+  let ack = workerAlive && existing.worker ? await waitForControlAck(workspaceRoot, job.id, op.id, ackTimeout, 50) : null;
+  const graceMs = options.force || (!existing.threadId && !existing.worker) ? 0 : Math.max(0, Number(options["grace-ms"] ?? process.env.CODEX_COMPANION_CANCEL_GRACE_MS) || 10000);
+  let interrupt = { attempted: false, interrupted: false, detail: null };
+  let fallbackStopConfirmed = false;
+  let fallbackWaited = false;
+  if (!ack && existing.transport === "broker" && existing.threadId) {
+    interrupt = await interruptAppServerTurn(cwd, {
+      threadId: existing.threadId,
+      turnId: existing.turnId ?? null,
+      brokerEndpoint: existing.brokerEndpoint,
+      noSpawn: true
+    });
+    if (interrupt.interrupted) {
+      const stopped = await waitForAppServerThreadStop(cwd, { threadId: existing.threadId, brokerEndpoint: existing.brokerEndpoint, timeoutMs: graceMs });
+      fallbackStopConfirmed = stopped.confirmed;
+      fallbackWaited = true;
+      if (!stopped.confirmed) interrupt.detail = stopped.detail;
+    }
+  }
 
+  const waitUntil = Date.now() + (fallbackWaited || interrupt.errorCode === "broker-not-found" ? 0 : graceMs);
+  let latest = readStoredJob(workspaceRoot, job.id) ?? existing;
+  while (Date.now() < waitUntil) {
+    ack = readControlAck(workspaceRoot, job.id, op.id) ?? ack;
+    latest = readStoredJob(workspaceRoot, job.id) ?? latest;
+    if (ack?.turnConfirmedStopped || ["cancelled", "completed", "failed"].includes(latest.status)) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  ack = readControlAck(workspaceRoot, job.id, op.id) ?? ack;
+  latest = readStoredJob(workspaceRoot, job.id) ?? latest;
+  if (["completed", "failed"].includes(latest.status)) {
+    outputCommandResult(
+      { jobId: job.id, status: latest.status, title: job.title, cancel: latest.cancel ?? null, result: latest.result ?? null },
+      renderCancelReport({ ...job, ...latest }),
+      options.json
+    );
+    return;
+  }
+  let turnConfirmedStopped = Boolean(ack?.turnConfirmedStopped || fallbackStopConfirmed);
+
+  let termination = { delivered: false, exited: !workerAlive, escalated: false, residualPids: [] };
+  if (workerAlive) termination = await terminateProcessTreeVerified(workerPid, {
+    group: worker.processGroup === true,
+    graceMs: Number(process.env.CODEX_COMPANION_KILL_WAIT_MS) || 5000,
+    killWaitMs: Number(process.env.CODEX_COMPANION_KILL_VERIFY_MS) || 1000
+  });
+  const workerExited = termination.exited || !isSameProcess({ pid: workerPid, startTime: worker.startTime ?? null });
+  const appServerPid = Number(existing.transport === "direct" ? existing.appServerPid : NaN);
+  const hasDirectAppServerPid = Number.isInteger(appServerPid) && appServerPid > 0;
+  const appServerExited = existing.transport === "direct"
+    ? hasDirectAppServerPid && !isSameProcess({ pid: appServerPid, startTime: existing.appServerStartTime ?? null })
+    : true;
+  if (existing.transport === "direct" && appServerExited) turnConfirmedStopped = true;
+  if (!existing.threadId && !existing.transport && workerExited) turnConfirmedStopped = true;
+  latest = readStoredJob(workspaceRoot, job.id) ?? latest;
+  if (["completed", "failed"].includes(latest.status)) {
+    outputCommandResult(
+      { jobId: job.id, status: latest.status, title: job.title, cancel: latest.cancel ?? null, result: latest.result ?? null },
+      renderCancelReport({ ...job, ...latest }),
+      options.json
+    );
+    return;
+  }
+  const verified = turnConfirmedStopped && workerExited && (existing.transport !== "direct" || appServerExited);
+  const cancel = {
+    requestedAt,
+    reason: "user",
+    interruptDelivered: Boolean(ack?.interruptDelivered || interrupt.interrupted),
+    turnConfirmedStopped,
+    escalated: Boolean(termination.escalated),
+    workerExited,
+    appServerExited: existing.transport === "direct" ? appServerExited : null,
+    residualPids: [...new Set([...(termination.residualPids ?? []), ...(!appServerExited && Number.isFinite(appServerPid) ? [appServerPid] : [])])],
+    residualTurns: !turnConfirmedStopped && existing.transport === "broker" && existing.threadId
+      ? [{ threadId: existing.threadId, turnId: existing.turnId ?? null, brokerEndpoint: existing.brokerEndpoint ?? null }]
+      : [],
+    detail: interrupt.errorCode === "broker-not-found" ? "broker-not-found" : !turnConfirmedStopped && existing.transport === "broker"
+      ? "broker turn stop could not be verified"
+      : interrupt.detail ?? (verified ? "Turn stop and worker exit verified." : "Cancellation could not be fully verified.")
+  };
+  const status = verified ? "cancelled" : "cancel-failed";
   const completedAt = nowIso();
-  const nextJob = {
-    ...job,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    completedAt,
-    errorMessage: "Cancelled by user."
-  };
-
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
-  });
-
-  const payload = {
-    jobId: job.id,
-    status: "cancelled",
-    title: job.title,
-    turnInterruptAttempted: interrupt.attempted,
-    turnInterrupted: interrupt.interrupted
-  };
-
+  const nextJob = { ...existing, ...latest, status, phase: status, cancel, cancelReason: "user", pid: workerExited ? null : workerPid, completedAt, ...(verified ? {} : { errorMessage: "Cancellation could not be verified." }) };
+  writeJobFile(workspaceRoot, job.id, nextJob);
+  upsertJob(workspaceRoot, { id: job.id, status, phase: status, pid: nextJob.pid, completedAt, errorMessage: nextJob.errorMessage });
+  appendLogLine(job.logFile, `Cancel ${status}: interrupt ${cancel.interruptDelivered ? "delivered" : "not confirmed"}; worker ${workerExited ? "exited" : "still alive"}; turn ${turnConfirmedStopped ? "stopped" : "not verified"}.`);
+  const payload = { jobId: job.id, status, title: job.title, cancel, ...(!verified ? { error: { code: "cancel-failed", message: "Cancellation could not be verified." } } : {}) };
   outputCommandResult(payload, renderCancelReport(nextJob), options.json);
+  if (!verified) process.exitCode = EXIT.USAGE;
 }
 
 async function main() {

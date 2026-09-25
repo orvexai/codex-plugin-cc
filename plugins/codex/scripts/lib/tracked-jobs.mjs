@@ -89,7 +89,7 @@ export function spawnTaskWorker({ scriptPath, cwd, workspaceRoot, jobId, env = p
     fs.closeSync(stderrFd);
   }
   child.unref();
-  return { pid: child.pid ?? null, startTime: readProcessStartTime(child.pid), stderrFile };
+  return { pid: child.pid ?? null, startTime: readProcessStartTime(child.pid), stderrFile, processGroup: process.platform !== "win32" };
 }
 
 export function recordTaskWorker(workspaceRoot, jobId, worker) {
@@ -189,7 +189,8 @@ export async function runTrackedJob(job, runner, options = {}) {
     const startedRecord = recordTaskRunning(job.workspaceRoot, runningRecord, worker);
     if (!startedRecord || startedRecord.status !== "running") throw new Error(`Job ${job.id} is no longer active.`);
     const execution = await runner();
-    const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
+    const controlledCancel = execution.cancelledByControl ?? null;
+    const completionStatus = controlledCancel ? "cancelled" : execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
     // Merge over the stored record: the turn may have added fields while it
     // ran (e.g. deliveredMessageIds from `send`) that the final write must keep.
@@ -202,6 +203,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       pid: null,
       worker: { ...worker, ...stored?.worker, pid: null },
       phase: completionStatus === "completed" ? "done" : "failed",
+      ...(controlledCancel ? { phase: "cancelled", cancelReason: controlledCancel.reason || "user", cancel: { ...(stored?.cancel ?? {}), reason: controlledCancel.reason || "user", interruptDelivered: Boolean(controlledCancel.interruptDelivered), turnConfirmedStopped: Boolean(controlledCancel.turnConfirmedStopped) } } : {}),
       completedAt,
       result: execution.payload,
       rendered: execution.rendered,
