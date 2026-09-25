@@ -1,3 +1,11 @@
+export class UsageError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "UsageError";
+    this.exitCode = 2;
+  }
+}
+
 export function parseArgs(argv, config = {}) {
   const valueOptions = new Set(config.valueOptions ?? []);
   const booleanOptions = new Set(config.booleanOptions ?? []);
@@ -5,6 +13,7 @@ export function parseArgs(argv, config = {}) {
   const options = {};
   const positionals = [];
   let passthrough = false;
+  let hasPositional = false;
 
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
@@ -21,14 +30,16 @@ export function parseArgs(argv, config = {}) {
 
     if (!token.startsWith("-") || token === "-") {
       positionals.push(token);
+      hasPositional = true;
       continue;
     }
 
     if (token.startsWith("--")) {
       const [rawKey, inlineValue] = token.slice(2).split("=", 2);
       const key = aliasMap[rawKey] ?? rawKey;
+      const isHelp = config.strict === true && rawKey === "help";
 
-      if (booleanOptions.has(key)) {
+      if (isHelp || booleanOptions.has(key)) {
         options[key] = inlineValue === undefined ? true : inlineValue !== "false";
         continue;
       }
@@ -36,7 +47,7 @@ export function parseArgs(argv, config = {}) {
       if (valueOptions.has(key)) {
         const nextValue = inlineValue ?? argv[index + 1];
         if (nextValue === undefined) {
-          throw new Error(`Missing value for --${rawKey}`);
+          throw new UsageError(`Missing value for --${rawKey}`);
         }
         options[key] = nextValue;
         if (inlineValue === undefined) {
@@ -45,14 +56,18 @@ export function parseArgs(argv, config = {}) {
         continue;
       }
 
+      if (config.strict && !hasPositional) {
+        throw new UsageError(`Unknown option: --${rawKey}`);
+      }
       positionals.push(token);
       continue;
     }
 
     const shortKey = token.slice(1);
-    const key = aliasMap[shortKey] ?? shortKey;
+    const isHelp = config.strict === true && shortKey === "h";
+    const key = isHelp ? "help" : aliasMap[shortKey] ?? shortKey;
 
-    if (booleanOptions.has(key)) {
+    if (isHelp || booleanOptions.has(key)) {
       options[key] = true;
       continue;
     }
@@ -60,14 +75,18 @@ export function parseArgs(argv, config = {}) {
     if (valueOptions.has(key)) {
       const nextValue = argv[index + 1];
       if (nextValue === undefined) {
-        throw new Error(`Missing value for -${shortKey}`);
+        throw new UsageError(`Missing value for -${shortKey}`);
       }
       options[key] = nextValue;
       index += 1;
       continue;
     }
 
+    if (config.strict && !hasPositional) {
+      throw new UsageError(`Unknown option: -${shortKey}`);
+    }
     positionals.push(token);
+    hasPositional = true;
   }
 
   return { options, positionals };
