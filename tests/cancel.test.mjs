@@ -1,3 +1,4 @@
+import "./_isolation.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -443,8 +444,13 @@ test("deep reconcile helper recovers a completed broker turn after its worker di
   const oldPluginData = process.env.CLAUDE_PLUGIN_DATA;
   process.env.CLAUDE_PLUGIN_DATA = path.join(workspace.home, "plugin-data");
   try {
-    const lost = reconcileJob(workspace.repo, job);
-    await reconcileJobDeep(workspace.repo, lost);
+    // Under machine load the 1.2s fake turn can still be active here; deep
+    // reconcile then records "orphaned" and a later pass recovers it.
+    await waitFor(async () => {
+      const lost = reconcileJob(workspace.repo, JSON.parse(fs.readFileSync(jobFile, "utf8")));
+      await reconcileJobDeep(workspace.repo, lost);
+      return JSON.parse(fs.readFileSync(jobFile, "utf8")).status === "completed";
+    }, { timeoutMs: 8000, intervalMs: 250 });
   }
   finally { if (oldPluginData === undefined) delete process.env.CLAUDE_PLUGIN_DATA; else process.env.CLAUDE_PLUGIN_DATA = oldPluginData; }
   const reconciled = JSON.parse(fs.readFileSync(jobFile, "utf8"));

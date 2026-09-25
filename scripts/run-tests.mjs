@@ -1,74 +1,26 @@
 #!/usr/bin/env node
-// Runs the test suite with a scrubbed environment. When `npm test` is started
-// from inside a Claude Code session the plugin's own session variables leak in
-// and redirect state directories, which makes otherwise-passing tests fail.
-import { spawnSync } from "node:child_process";
+// Runs the test suite in a sandbox. When `npm test` is started from inside a
+// Claude Code session the plugin's own session variables leak in and redirect
+// state directories; worse, tests could reach the user's real HOME, Codex
+// credentials or `codex` binary. Everything here lives under one sandbox root
+// that is reaped and removed afterwards. Each test file additionally isolates
+// and reaps itself through tests/_isolation.mjs (nested inside this sandbox).
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { applySandboxEnv, createSandbox, reapSandboxProcesses, startWatchdog } from "./test-sandbox.mjs";
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const LEAKY_ENV = [
-  "CLAUDE_PLUGIN_DATA",
-  "CLAUDE_ENV_FILE",
-  "CODEX_COMPANION_SESSION_ID",
-  "CODEX_COMPANION_TRANSCRIPT_PATH",
-  "CODEX_COMPANION_APP_SERVER_ENDPOINT",
-  "CODEX_COMPANION_APP_SERVER_PID_FILE",
-  "CODEX_COMPANION_APP_SERVER_LOG_FILE",
-  "CODEX_COMPANION_CONFIG",
-  "CODEX_COMPANION_MODEL",
-  "CODEX_COMPANION_EFFORT",
-  "CODEX_COMPANION_SANDBOX",
-  "CODEX_COMPANION_NETWORK",
-  "CODEX_COMPANION_LOCK_TIMEOUT_MS",
-  "CODEX_COMPANION_CANCEL_GRACE_MS",
-  "CODEX_COMPANION_KILL_VERIFY_MS",
-  "CODEX_COMPANION_KILL_WAIT_MS",
-  "CODEX_COMPANION_CONTROL_ACK_MS",
-  "CODEX_COMPANION_CONTROL_POLL_MS"
-];
 
-const env = { ...process.env };
-for (const name of LEAKY_ENV) {
-  delete env[name];
-}
-// Keep tests away from the user's real global defaults and launcher, and give
-// the run its own TMPDIR: test repos, fake Codex binaries and broker sockets
-// all live under it, so everything the run spawned can be found and stopped.
-const sandboxHome = fs.mkdtempSync(path.join(os.tmpdir(), "cpt-"));
-const sandboxTmp = path.join(sandboxHome, "tmp");
-fs.mkdirSync(sandboxTmp);
-env.CODEX_COMPANION_CONFIG = path.join(sandboxHome, "config.json");
-env.CODEX_COMPANION_BIN_DIR = path.join(sandboxHome, "bin");
-env.TMPDIR = sandboxTmp;
-env.TMP = sandboxTmp;
-env.TEMP = sandboxTmp;
-
-// Tests start shared brokers lazily and never shut them down; without this a
-// few full runs leave hundreds of broker and app-server processes behind.
-function reapTestProcesses(marker) {
-  if (process.platform === "win32") {
-    return 0;
-  }
-  const listing = spawnSync("ps", ["-eo", "pid=,args="], { encoding: "utf8" });
-  const pids = String(listing.stdout ?? "")
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.includes(marker))
-    .map((line) => Number(line.split(/\s+/)[0]))
-    .filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid);
-  for (const pid of pids) {
-    try {
-      process.kill(pid, "SIGTERM");
-    } catch {
-      // Already gone.
-    }
-  }
-  return pids.length;
-}
+// HOME, CODEX_HOME, XDG_*, TMPDIR, plugin config and launcher dir all point
+// into the sandbox; leaky CLAUDE_*/CODEX_COMPANION_* variables are stripped;
+// a guard `codex` that exits 97 shadows the real binary on PATH.
+const sandbox = createSandbox();
+const env = applySandboxEnv({ ...process.env }, sandbox);
 
 const testsDir = path.join(ROOT, "tests");
 const requested = process.argv.slice(2);
@@ -81,10 +33,62 @@ const files =
         .sort()
         .map((name) => path.join("tests", name));
 
-const result = spawnSync(process.execPath, ["--test", ...files], { cwd: ROOT, env, stdio: "inherit" });
-const reaped = reapTestProcesses(sandboxHome);
-if (reaped > 0) {
-  process.stderr.write(`Stopped ${reaped} leftover test process(es).\n`);
+// Backstop if this runner itself is SIGKILLed: reaps the sandbox once we die.
+const watchdogPid = startWatchdog(sandbox.root, { env });
+
+// Asynchronous so that SIGINT/SIGTERM/SIGHUP (e.g. Ctrl-C on the process
+// group) reach our handlers: forward the signal, give the child a moment, then
+// always reap and run the survivor check before exiting.
+const SIGNAL_CHILD_WAIT_MS = 5000;
+const child = spawn(process.execPath, ["--test", ...files], { cwd: ROOT, env, stdio: "inherit" });
+let receivedSignal = null;
+const childExit = new Promise((resolve) => {
+  child.once("error", (error) => {
+    process.stderr.write(`Failed to start the test runner: ${error.message}\n`);
+    resolve({ code: 1, signal: null });
+  });
+  child.once("exit", (code, signal) => resolve({ code, signal }));
+});
+for (const name of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(name, () => {
+    if (receivedSignal) return; // Already shutting down; cleanup below still runs.
+    receivedSignal = name;
+    process.stderr.write(`\nReceived ${name}; stopping tests and reaping the sandbox...\n`);
+    try {
+      child.kill(name);
+    } catch {
+      // Already gone.
+    }
+    setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }, SIGNAL_CHILD_WAIT_MS).unref();
+  });
 }
-fs.rmSync(sandboxHome, { recursive: true, force: true });
-process.exit(result.status ?? 1);
+
+const result = await childExit;
+
+// Tests start shared brokers lazily; anything still referencing the sandbox
+// (command line or environment) is stopped here: SIGTERM, then SIGKILL. This
+// includes our watchdog, which is no longer needed.
+const { reaped, survivors } = reapSandboxProcesses(sandbox.root);
+const leftovers = reaped.filter((proc) => proc.pid !== watchdogPid);
+if (leftovers.length > 0) {
+  process.stderr.write(`Stopped ${leftovers.length} leftover test process(es).\n`);
+}
+if (survivors.length > 0) {
+  process.stderr.write(
+    `ERROR: ${survivors.length} test process(es) survived reaping (sandbox ${sandbox.root} left in place):\n` +
+      survivors.map((p) => `  ${p.pid} ${p.args}`).join("\n") +
+      "\n"
+  );
+  process.exit(1);
+}
+fs.rmSync(sandbox.root, { recursive: true, force: true });
+if (receivedSignal) {
+  process.exit(128 + (os.constants.signals[receivedSignal] ?? 1));
+}
+process.exit(result.code ?? 1);
