@@ -148,3 +148,38 @@ vite.config.ts.timestamp-*
 
 output/
 plugins/codex/.generated/
+
+# Houston-backed beads: .beads/ is local machine state (a pointer at the
+# central Dolt gateway plus this clone's credential), never repository content.
+# Added by `houston beads init`.
+.beads/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
+
+# houston-installer: generated agent payload is not tracked
+/.claude/*
+!/.claude/settings.json
+/.codex/
+/.agents/
+/.cursor/
+/.grok/
+/.opencode/
+/.config/opencode/
+/.cache
+/_bmad/**
+/_bmad/scripts
+!/_bmad/
+!/_bmad/*/
+!/_bmad/config.toml
+!/_bmad/config.user.toml
+!/_bmad/*/config.yaml
+!/_bmad/custom/
+!/_bmad/custom/*.toml
+!/_bmad/custom/*.yaml
+/_bmad/render/
+.cache/linear/

@@ -1,0 +1,31 @@
+# Wiki-first agent override for the stock BMAD Developer (Amelia / "dev").
+# Sparse, append-only — copy to {project-root}/_bmad/custom/bmad-agent-dev.toml during
+# install. Merged at activation by resolve_customization.py (base -> team -> user;
+# arrays append).
+# CAPABILITY REQUIREMENT (LOUD): the upstream agent skill must run
+# resolve_customization.py and merge _bmad/custom/bmad-agent-dev.toml's [agent] table
+# before persona adoption. If that activation seam is absent, the installer or resolver
+# must report the override as unsupported; the observable symptom is that this file's
+# WIKI-FIRST activation, access check, and persistent facts do not appear.
+# Append-only, so it unions conflict-free with any other module's override.
+#
+# The dev loop is autonomous ("execute continuously without pausing"); these prepend
+# steps are read-only orientation that must NOT introduce a human pause in the happy
+# path. The wiki-first GATE itself (record + human-confirm intent) fires earlier at
+# the bmad-build planning checkpoint, where a human is present; before implementation the gate is only a read-only
+# token check (skill:houston-doc-spec-gate, honouring wiki_first_enforcement off|warn|block).
+
+[agent]
+
+activation_steps_prepend = [
+  "WIKI-FIRST (PRIMARY-SOURCE POLICY) — this is a living-wiki project and the project's Docmost wiki manual is the PRIMARY source of truth; it OUTRANKS the local filesystem. This binds EVERY turn — implementation AND free-form discussion. To answer any question about what the project IS or SHOULD do, resolve the wiki first (skill:houston-doc-read-first, or `docmost-cli ai ask \"<question>\" --output json`, or `docmost-cli search \"<topic>\" --cached --content --space {docmost_space} --output json` then `docmost-cli page get <slug> --output json`) rather than inferring from the code alone. The code conforms to the manual, never the reverse. Full doctrine: file:data/wiki-first-mandate.md.",
+  "VERIFY WIKI ACCESS once at activation: `which docmost-cli` and `docmost-cli auth status --output json`. If docmost-cli is absent or auth fails, tell {user_name} to run `docmost-cli auth login --instance {docmost_url} --token <api-key>`. Branch on exit code + the errorCode field, never on stderr text.",
+  "AS THE DEVELOPER — use a human-confirmed intent node from the wiki as grounding before writing code whenever the gate requires it. The wiki-first gate is a read-only token check immediately before bmad-build step-03-implement (`docmost-cli spec gate check <story-id> --output json` via skill:houston-doc-spec-gate) honouring wiki_first_enforcement: off disables enforcement, warn reports a miss and continues, and block (the default) HALTS on a genuine or unverifiable miss until intent is recorded + confirmed. A satisfied gate is a silent no-op; do NOT pause the autonomous loop in the happy path.",
+]
+
+persistent_facts = [
+  "skill:houston-doc-session-policy",
+  "file:data/wiki-first-mandate.md",
+  "file:data/decision-order.md",
+  "the wiki manual outranks the code; NEVER implement anything not mapped to a human-confirmed intent node in the wiki (wiki-first spec gate)",
+]
