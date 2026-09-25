@@ -13,6 +13,17 @@ const STATE_FILE_NAME = "state.json";
 const LOCK_FILE_NAME = "state.lock";
 const JOBS_DIR_NAME = "jobs";
 export const MAX_JOBS = 200;
+const TERMINAL_JOB_STATUSES = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "cancel-failed",
+  "interrupted",
+  "timed-out",
+  "lost",
+  "orphaned"
+]);
+const UNREAD_RETENTION_MS = 24 * 60 * 60 * 1000;
 const LOCK_TIMEOUT_MS = 15000;
 const LOCK_STALE_MS = 30000;
 
@@ -223,10 +234,22 @@ export function loadState(cwd) {
   }
 }
 
-function pruneJobs(jobs) {
-  return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
-    .slice(0, MAX_JOBS);
+function pruneJobs(jobs, { now = Date.now(), maxJobs = MAX_JOBS } = {}) {
+  const protectedJobs = [];
+  const otherJobs = [];
+  for (const job of jobs) {
+    const terminal = TERMINAL_JOB_STATUSES.has(job.status);
+    const completedAt = job.completedAt ?? job.updatedAt;
+    const age = Date.parse(completedAt ?? "");
+    const unreadAndRecent = terminal && job.resultReadAt == null && Number.isFinite(age) && now - age < UNREAD_RETENTION_MS;
+    if (!terminal || unreadAndRecent) {
+      protectedJobs.push(job);
+    } else {
+      otherJobs.push(job);
+    }
+  }
+  otherJobs.sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
+  return [...protectedJobs, ...otherJobs.slice(0, Math.max(0, maxJobs - protectedJobs.length))];
 }
 
 function removeFileIfExists(filePath) {
@@ -238,7 +261,8 @@ function removeFileIfExists(filePath) {
 function saveStateUnlocked(cwd, state) {
   const previousJobs = loadState(cwd).jobs;
   ensureStateDir(cwd);
-  const nextJobs = pruneJobs(state.jobs ?? []);
+  const proposedJobs = state.jobs ?? [];
+  const nextJobs = pruneJobs(proposedJobs);
   const nextState = {
     version: STATE_VERSION,
     config: {
@@ -249,7 +273,7 @@ function saveStateUnlocked(cwd, state) {
   };
 
   const retainedIds = new Set(nextJobs.map((job) => job.id));
-  for (const job of previousJobs) {
+  for (const job of [...previousJobs, ...proposedJobs]) {
     if (retainedIds.has(job.id)) {
       continue;
     }
@@ -296,6 +320,29 @@ export function upsertJob(cwd, jobPatch) {
       ...state.jobs[existingIndex],
       ...jobPatch,
       updatedAt: timestamp
+    };
+  });
+}
+
+export function markResultRead(cwd, jobId, { at = nowIso() } = {}) {
+  updateState(cwd, (state) => {
+    const existingIndex = state.jobs.findIndex((entry) => entry.id === jobId);
+    if (existingIndex === -1) {
+      return;
+    }
+
+    const job = state.jobs[existingIndex];
+    let payload = job;
+    try {
+      payload = readJobFile(resolveJobFile(cwd, jobId));
+    } catch {
+      // The index remains authoritative when an older job has no separate file.
+    }
+    writeJobFile(cwd, jobId, { ...payload, resultReadAt: at });
+    state.jobs[existingIndex] = {
+      ...job,
+      resultReadAt: at,
+      updatedAt: nowIso()
     };
   });
 }
