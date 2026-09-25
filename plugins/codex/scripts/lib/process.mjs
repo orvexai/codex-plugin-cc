@@ -1,5 +1,35 @@
+import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import process from "node:process";
+
+export function isProcessAlive(pid) {
+  if (!Number.isInteger(Number(pid)) || Number(pid) <= 0) return false;
+  try { process.kill(Number(pid), 0); return true; } catch (error) { return error?.code === "EPERM"; }
+}
+
+export function readProcessStartTime(pid) {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) return null;
+  if (process.platform === "linux") {
+    try {
+      const stat = fs.readFileSync(`/proc/${numericPid}/stat`, "utf8");
+      const end = stat.lastIndexOf(")");
+      const fields = stat.slice(end + 1).trim().split(/\s+/);
+      return fields[19] ?? null;
+    } catch { return null; }
+  }
+  if (process.platform === "darwin") {
+    const result = spawnSync("ps", ["-o", "lstart=", "-p", String(numericPid)], { encoding: "utf8" });
+    return result.status === 0 && result.stdout.trim() ? result.stdout.trim() : null;
+  }
+  return null;
+}
+
+export function isSameProcess({ pid, startTime }) {
+  if (!isProcessAlive(Number(pid))) return false;
+  const current = readProcessStartTime(pid);
+  return !(startTime != null && current != null && String(startTime) !== String(current));
+}
 
 export function runCommand(command, args = [], options = {}) {
   const result = spawnSync(command, args, {
