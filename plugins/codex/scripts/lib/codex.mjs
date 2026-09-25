@@ -1460,7 +1460,7 @@ function startControlPoller(client, threadId, turnId, options) {
       const currentJob = options.workspaceRoot && options.jobId ? readJobFile(resolveJobFile(options.workspaceRoot, options.jobId)) : null;
       const currentOwner = currentJob?.owner ?? options.owner;
       const ownerExitPolicy = currentJob?.onOwnerExit ?? options.onOwnerExit;
-      if (currentOwner && ownerExitPolicy === "cancel") {
+      if (currentOwner && currentOwner.kind !== "none" && currentOwner.kind !== "detached" && ownerExitPolicy === "cancel") {
         const ownerState = assessOwner(options.workspaceRoot, { id: options.jobId, owner: currentOwner });
         if (!ownerState.alive) {
           appendControlOp(options.workspaceRoot, options.jobId, { op: "cancel", reason: "owner-lost" });

@@ -16,7 +16,6 @@ import {
     getSessionRuntimeStatus,
     importExternalAgentSession,
     interruptAppServerTurn,
-    markBrokerThreadDetached,
     waitForAppServerThreadStop,
     parseStructuredOutput,
     readOutputSchema,
@@ -1117,12 +1116,11 @@ async function handleTask(argv) {
 
   if (options.attach && options.detach) throw new Error("Choose either --attach or --detach.");
   if ((options.attach || options.detach) && options["owner-pid"]) throw new Error("--owner-pid cannot be combined with --attach or --detach.");
-  const configuredOwnerExit = getConfig(workspaceRoot).onOwnerExit ?? getGlobalConfig().onOwnerExit ?? "cancel";
-  const onOwnerExit = options["on-owner-exit"] ?? ((options.detach || (options.background && !options["owner-pid"])) ? "continue" : configuredOwnerExit);
+  const onOwnerExit = options["on-owner-exit"] ?? (options.detach ? "continue" : (getConfig(workspaceRoot).onOwnerExit ?? getGlobalConfig().onOwnerExit ?? "cancel"));
   if (!["cancel", "continue"].includes(onOwnerExit)) throw new Error("--on-owner-exit must be cancel or continue.");
   const ownerPid = options["owner-pid"] === undefined ? null : Number(options["owner-pid"]);
   if (ownerPid !== null && (!Number.isInteger(ownerPid) || ownerPid <= 0)) throw new Error("--owner-pid must be a positive process id.");
-  const ownerKind = options.attach ? "attach" : options.detach ? "detached" : ownerPid ? "pid" : options.background ? "detached" : "foreground";
+  const ownerKind = options.attach ? "attach" : options.detach ? "detached" : ownerPid ? "pid" : options.background ? "none" : "foreground";
   const owner = {
     kind: ownerKind,
     pid: ownerKind === "attach" || ownerKind === "foreground" ? process.pid : ownerKind === "pid" ? ownerPid : null,
@@ -1154,7 +1152,7 @@ async function handleTask(argv) {
       try { await followAttachedJob(job.id, workspaceRoot, logFile, options); }
       finally { heartbeat.stop(); }
     } else {
-      if (!options.json && owner.kind === "detached" && options.background && !options.detach) process.stderr.write(`Warning: job ${job.id} is unowned (use --attach). Stop it with: node scripts/codex-companion.mjs cancel ${job.id}\n`);
+      if (!options.json && owner.kind === "none" && options.background) process.stderr.write(`Warning: job ${job.id} is unowned (use --attach). Stop it with: node scripts/codex-companion.mjs cancel ${job.id}\n`);
       outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     }
     return;
@@ -1230,12 +1228,10 @@ async function followAttachedJob(jobId, workspaceRoot, logFile, options) {
           if (!isActiveJobStatus(stored?.status)) return stored;
           return {
             ...stored,
-            owner: { ...stored.owner, kind: "detached", pid: null, startTime: null, brokerDetached: true },
-            onOwnerExit: "continue"
+            owner: { ...stored.owner, kind: "none", pid: null, startTime: null, brokerDetached: false }
           };
         });
         if (!isActiveJobStatus(job?.status)) continue;
-        if (job.threadId && job.transport === "broker") await markBrokerThreadDetached(job.cwd ?? workspaceRoot, { threadId: job.threadId, brokerEndpoint: job.brokerEndpoint }).catch(() => {});
         process.stdout.write(`Wait with: node scripts/codex-companion.mjs wait ${jobId}\nCancel with: node scripts/codex-companion.mjs cancel ${jobId}\n`);
         process.exitCode = EXIT.WAITER_TIMEOUT;
         return;

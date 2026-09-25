@@ -202,7 +202,10 @@ async function main() {
 
         if (message.method === "broker/markDetached") {
           const threadId = message.params?.threadId;
-          if (threadId) detachedThreads.add(threadId);
+          if (threadId) {
+            detachedThreads.add(threadId);
+            process.stderr.write(`Marked broker thread ${threadId} detached.\n`);
+          }
           send(socket, { id: message.id, result: {} });
           continue;
         }

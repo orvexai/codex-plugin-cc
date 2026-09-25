@@ -21,7 +21,7 @@ import {
 import { appendControlOp } from "./lib/control-channel.mjs";
 import { reconcileJob } from "./lib/job-liveness.mjs";
 import { isActiveJobStatus } from "./lib/exit-codes.mjs";
-import { getConfig, getGlobalConfig, isSafeJobId, listJobs, resolveJobsDir, resolveStateFile, updateJobRecord, writeFileAtomic } from "./lib/state.mjs";
+import { isSafeJobId, listJobs, resolveJobsDir, resolveStateFile, updateJobRecord, writeFileAtomic } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -53,13 +53,12 @@ function cleanupSessionJobs(cwd, sessionId) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const stateFile = resolveStateFile(workspaceRoot);
   const hasState = fs.existsSync(stateFile);
-  const policy = hasState ? (getConfig(workspaceRoot).sessionEndPolicy ?? getGlobalConfig().sessionEndPolicy ?? "cancel") : "cancel";
   const sessionJobs = hasState ? listJobs(workspaceRoot).filter((job) => job.sessionId === sessionId).map((job) => reconcileJob(workspaceRoot, job)) : [];
   const summaryJobs = [];
   for (const job of sessionJobs) {
     let action = "none";
     if (isActiveJobStatus(job.status)) {
-      const detach = job.owner?.kind === "detached" || policy === "detach";
+      const detach = job.owner?.kind === "detached";
       const endedAt = new Date().toISOString();
       if (detach) {
         const updated = updateJobRecord(workspaceRoot, job.id, (stored) => isActiveJobStatus(stored?.status)

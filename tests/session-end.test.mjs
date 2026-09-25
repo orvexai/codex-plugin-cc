@@ -29,6 +29,15 @@ function stateDir(ws) {
   return path.join(ws.home, "plugin-data", "state", `${slug}-${hash}`);
 }
 
+function readBrokerLog(ws) {
+  try {
+    return fs.readFileSync(path.join(stateDir(ws), "broker.log"), "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  }
+}
+
 test("SessionEnd preserves job artifacts, cancels active work, and writes a non-job summary", async (t) => {
   const ws = await makeCompanionWorkspace("interruptible-slow-task", { fakeOptions: { turnScript: [{ type: "silence" }] } });
   t.after(ws.close);
@@ -37,11 +46,17 @@ test("SessionEnd preserves job artifacts, cancels active work, and writes a non-
   const running = ws.companion(["task", "--background", "--json", "running work"], { env });
   assert.equal(running.status, 0, running.stderr);
   const runningId = JSON.parse(running.stdout).jobId;
+  const runningBeforeEnd = JSON.parse(ws.companion(["status", runningId, "--json"], { env }).stdout).job;
+  assert.equal(runningBeforeEnd.owner.kind, "none");
   await waitFor(() => {
     const job = JSON.parse(ws.companion(["status", runningId, "--json"], { env }).stdout).job;
     return job?.status === "running" && job.turnId ? job : null;
   }, { timeoutMs: 8000, intervalMs: 25 });
   const completedId = addCompletedJob(ws, "completed-fixture", sessionId);
+  const stateFile = path.join(stateDir(ws), "state.json");
+  const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  state.config.sessionEndPolicy = "detach";
+  fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
   const jobsDir = path.join(stateDir(ws), "jobs");
   const before = fs.readdirSync(jobsDir).sort();
   const ended = runSessionEnd(ws, sessionId);
@@ -56,6 +71,8 @@ test("SessionEnd preserves job artifacts, cancels active work, and writes a non-
   const immediate = JSON.parse(ws.companion(["status", runningId, "--json"], { env }).stdout).job;
   assert.ok(["cancel-pending", "cancelled"].includes(immediate.status));
   assert.equal(immediate.cancelReason, "session-ended");
+  const brokerLog = readBrokerLog(ws);
+  assert.doesNotMatch(brokerLog, new RegExp(`Marked broker thread ${immediate.threadId} detached\\.`));
   const summaryFile = path.join(jobsDir, `session-end-${sessionId}.json`);
   assert.ok(fs.existsSync(summaryFile));
   const summary = JSON.parse(fs.readFileSync(summaryFile, "utf8"));
@@ -87,11 +104,11 @@ test("SessionEnd removes only its lease while another session keeps the shared b
   assert.ok(job);
 });
 
-test("SessionEnd detaches opted-out jobs and keeps the shared broker available", async (t) => {
+test("SessionEnd preserves explicitly detached jobs and marks their broker turn detached", async (t) => {
   const ws = await makeCompanionWorkspace("interruptible-slow-task", { fakeOptions: { turnScript: [{ type: "silence" }] } });
   t.after(ws.close);
   const env = { CODEX_COMPANION_SESSION_ID: "detach-a" };
-  const launch = ws.companion(["task", "--background", "--json", "detached work"], { env });
+  const launch = ws.companion(["task", "--background", "--detach", "--json", "detached work"], { env });
   assert.equal(launch.status, 0, launch.stderr);
   const id = JSON.parse(launch.stdout).jobId;
   await waitFor(() => JSON.parse(ws.companion(["status", id, "--json"], { env }).stdout).job?.turnId, { timeoutMs: 8000, intervalMs: 25 });
@@ -99,16 +116,15 @@ test("SessionEnd detaches opted-out jobs and keeps the shared broker available",
   const jobsDir = path.join(stateDir(ws), "jobs");
   const jobFile = path.join(jobsDir, `${id}.json`);
   const job = JSON.parse(fs.readFileSync(jobFile, "utf8"));
-  const stateFile = path.join(stateDir(ws), "state.json");
-  const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-  state.config.sessionEndPolicy = "detach";
-  fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+  assert.equal(job.owner.kind, "detached");
   const ended = runSessionEnd(ws, "detach-a");
   assert.equal(ended.status, 0, ended.stderr);
   const updated = JSON.parse(fs.readFileSync(jobFile, "utf8"));
   assert.equal(updated.endedWithSession, true);
   assert.ok(updated.sessionEndedAt);
   assert.equal(updated.status, "running");
+  const brokerLog = readBrokerLog(ws);
+  assert.match(brokerLog, new RegExp(`Marked broker thread ${updated.threadId} detached\\.`));
   assert.ok(fs.existsSync(path.join(stateDir(ws), "broker.log")));
   assert.ok(fs.existsSync(path.join(stateDir(ws), "broker.json")));
   assert.ok(broker);

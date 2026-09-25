@@ -36,7 +36,9 @@ export function readHeartbeat(file) {
 
 export function assessOwner(workspaceRoot, job, { now = Date.now() } = {}) {
   const owner = job?.owner;
-  if (!owner || owner.kind === "detached") return { alive: false, reason: owner?.kind === "detached" ? "detached" : "owner-missing" };
+  if (!owner || owner.kind === "none" || owner.kind === "detached") {
+    return { alive: false, reason: owner?.kind === "detached" ? "detached" : owner?.kind === "none" ? "unowned" : "owner-missing" };
+  }
   const alive = isSameProcess({ pid: Number(owner.pid), startTime: owner.startTime ?? null });
   if (!alive) return { alive: false, reason: "owner-dead" };
   const heartbeatFile = resolveHeartbeatFile(workspaceRoot, job.id, "owner");

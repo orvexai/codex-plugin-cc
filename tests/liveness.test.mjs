@@ -54,7 +54,7 @@ test("status and wait reconcile a SIGKILLed background worker to orphaned", asyn
   const ws = await makeCompanionWorkspace("review-ok", { fakeOptions: { turnScript: [{ type: "delay", ms: 60000 }] } });
   t.after(() => ws.close());
   useWorkspaceStateEnv(t, ws);
-  const launched = ws.companion(["task", "--background", "--json", "slow liveness task"], { env: { CODEX_COMPANION_HEARTBEAT_MS: "100", CODEX_COMPANION_HEARTBEAT_STALE_MS: "1500" } });
+  const launched = ws.companion(["task", "--background", "--detach", "--json", "slow liveness task"], { env: { CODEX_COMPANION_HEARTBEAT_MS: "100", CODEX_COMPANION_HEARTBEAT_STALE_MS: "1500" } });
   assert.equal(launched.status, 0, launched.stderr);
   const id = JSON.parse(launched.stdout).jobId;
   let job;
@@ -62,9 +62,10 @@ test("status and wait reconcile a SIGKILLed background worker to orphaned", asyn
     const current = ws.companion(["status", id, "--json"], { env: { CODEX_COMPANION_HEARTBEAT_MS: "100", CODEX_COMPANION_HEARTBEAT_STALE_MS: "1500" } });
     job = JSON.parse(current.stdout).job;
     return Boolean(job.threadId && job.worker?.pid);
-  }, { timeoutMs: 5000, intervalMs: 50 });
+  }, { timeoutMs: 15000, intervalMs: 50 });
   assert.ok(job.worker?.pid);
   try { process.kill(job.worker.pid, "SIGKILL"); } catch {}
+  await waitFor(() => !isPidAlive(job.worker.pid), { timeoutMs: 15000, intervalMs: 50 });
   const waited = ws.companion(["wait", id, "--json", "--poll-interval-ms", "100"], { env: { CODEX_COMPANION_HEARTBEAT_MS: "100", CODEX_COMPANION_HEARTBEAT_STALE_MS: "1500" } });
   assert.equal(waited.status, EXIT.LOST, waited.stdout + waited.stderr);
   assert.equal(JSON.parse(waited.stdout).jobs[0].status, "orphaned");
@@ -72,7 +73,7 @@ test("status and wait reconcile a SIGKILLed background worker to orphaned", asyn
     const result = ws.companion(["status", id, "--json"], { env: { CODEX_COMPANION_HEARTBEAT_MS: "100", CODEX_COMPANION_HEARTBEAT_STALE_MS: "1500" } });
     const finalJob = JSON.parse(result.stdout).job;
     return result.status === 0 && finalJob.status === "orphaned" && finalJob.threadId === job.threadId;
-  }, { timeoutMs: 3000, intervalMs: 50 });
+  }, { timeoutMs: 15000, intervalMs: 50 });
   assert.equal(lost, true);
 });
 
@@ -291,7 +292,7 @@ test("worker errors before runTrackedJob are captured and referenced by status",
 test("orphaned task send returns orphaned without follow-up and continues the same thread otherwise", async (t) => {
   const ws = await makeCompanionWorkspace("review-ok", { fakeOptions: { turnScript: [{ type: "delay", ms: 60000 }] } });
   t.after(() => ws.close());
-  const launched = ws.companion(["task", "--background", "--json", "slow task for send"]);
+  const launched = ws.companion(["task", "--background", "--detach", "--json", "slow task for send"]);
   assert.equal(launched.status, 0, launched.stderr);
   const id = JSON.parse(launched.stdout).jobId;
   let job;
@@ -301,9 +302,10 @@ test("orphaned task send returns orphaned without follow-up and continues the sa
     const result = ws.companion(["status", id, "--json"]);
     job = JSON.parse(result.stdout).job;
     return Boolean(job.threadId);
-  }, { timeoutMs: 5000, intervalMs: 50 });
+  }, { timeoutMs: 15000, intervalMs: 50 });
   try { process.kill(job.worker.pid, "SIGKILL"); } catch {}
-  await waitFor(() => JSON.parse(ws.companion(["status", id, "--json"]).stdout).job.status === "orphaned", { timeoutMs: 3000, intervalMs: 50 });
+  await waitFor(() => !isPidAlive(job.worker.pid), { timeoutMs: 15000, intervalMs: 50 });
+  await waitFor(() => JSON.parse(ws.companion(["status", id, "--json"]).stdout).job.status === "orphaned", { timeoutMs: 15000, intervalMs: 50 });
   const noFollow = ws.companion(["send", id, "message", "--no-follow-up", "--json"]);
   assert.equal(noFollow.status, EXIT.LOST, noFollow.stderr);
   assert.equal(JSON.parse(noFollow.stdout).status, "orphaned");

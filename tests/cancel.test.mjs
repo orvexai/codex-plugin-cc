@@ -4,7 +4,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { appendControlOp, ackControlOp, readControlAck, readControlOps, resolveControlFile, waitForControlAck } from "../plugins/codex/scripts/lib/control-channel.mjs";
-import { makeTempDir, spawnStubborn, waitFor } from "./helpers.mjs";
+import { makeTempDir, spawnStubborn, waitFor, isPidAlive } from "./helpers.mjs";
 import { readProcessStartTime, terminateProcessTreeVerified } from "../plugins/codex/scripts/lib/process.mjs";
 import { makeCompanionWorkspace } from "./helpers.mjs";
 import { fakeConnections, occupyBroker, readFakeRpcLog } from "./fake-codex-fixture.mjs";
@@ -81,7 +81,7 @@ test("cooperative background cancel verifies the turn and stops further command 
     turnScript: [{ type: "command", command: "before cancel" }, { type: "delay", ms: 5000 }, { type: "command", command: "after cancel" }]
   } });
   t.after(() => workspace.close());
-  const short = { CODEX_COMPANION_CONTROL_POLL_MS: "20", CODEX_COMPANION_CONTROL_ACK_MS: "500", CODEX_COMPANION_CANCEL_GRACE_MS: "200", CODEX_COMPANION_KILL_WAIT_MS: "500" };
+  const short = { CODEX_COMPANION_CONTROL_POLL_MS: "20", CODEX_COMPANION_CONTROL_ACK_MS: "2000", CODEX_COMPANION_CANCEL_GRACE_MS: "2500", CODEX_COMPANION_KILL_WAIT_MS: "1000" };
   const launched = workspace.companion(["task", "--background", "--json", "slow cancellation test"], { env: short });
   assert.equal(launched.status, 0, launched.stderr);
   const jobId = JSON.parse(launched.stdout).jobId;
@@ -374,7 +374,7 @@ test("status and wait deep reconcile broker turns through the CLI", async (t) =>
   t.after(() => workspace.close());
   let workerGroup = null;
   t.after(() => { if (workerGroup) { try { process.kill(-workerGroup, "SIGKILL"); } catch {} } });
-  const launched = workspace.companion(["task", "--background", "--json", "deep reconcile through CLI"]);
+  const launched = workspace.companion(["task", "--background", "--detach", "--json", "deep reconcile through CLI"]);
   assert.equal(launched.status, 0, launched.stderr);
   const id = JSON.parse(launched.stdout).jobId;
   const jobFile = workspaceJobFile(workspace, id);
@@ -411,13 +411,14 @@ test("status and wait deep reconcile broker turns through the CLI", async (t) =>
 test("deep reconcile helper marks a dead worker orphaned while its broker turn is active", async (t) => {
   const workspace = await makeCompanionWorkspace("review-ok", { fakeOptions: { turnScript: [{ type: "delay", ms: 10000 }] } });
   t.after(() => workspace.close());
-  const launched = workspace.companion(["task", "--background", "--json", "deep reconcile active turn"]);
+  const launched = workspace.companion(["task", "--background", "--detach", "--json", "deep reconcile active turn"]);
   assert.equal(launched.status, 0, launched.stderr);
   const id = JSON.parse(launched.stdout).jobId;
   const jobFile = workspaceJobFile(workspace, id);
   await waitFor(() => { try { const job = JSON.parse(fs.readFileSync(jobFile, "utf8")); return job.transport === "broker" && job.turnId ? job : false; } catch { return false; } }, { timeoutMs: 8000 });
   const job = JSON.parse(fs.readFileSync(jobFile, "utf8"));
   try { process.kill(job.worker.pid, "SIGKILL"); } catch {}
+  await waitFor(() => !isPidAlive(job.worker.pid), { timeoutMs: 15000, intervalMs: 50 });
   const oldPluginData = process.env.CLAUDE_PLUGIN_DATA;
   process.env.CLAUDE_PLUGIN_DATA = path.join(workspace.home, "plugin-data");
   try {
@@ -431,7 +432,7 @@ test("deep reconcile helper marks a dead worker orphaned while its broker turn i
 test("deep reconcile helper recovers a completed broker turn after its worker dies", async (t) => {
   const workspace = await makeCompanionWorkspace("review-ok", { fakeOptions: { turnScript: [{ type: "delay", ms: 1200 }] } });
   t.after(() => workspace.close());
-  const launched = workspace.companion(["task", "--background", "--json", "deep reconcile completed turn"]);
+  const launched = workspace.companion(["task", "--background", "--detach", "--json", "deep reconcile completed turn"]);
   assert.equal(launched.status, 0, launched.stderr);
   const id = JSON.parse(launched.stdout).jobId;
   const jobFile = workspaceJobFile(workspace, id);

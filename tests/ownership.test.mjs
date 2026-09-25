@@ -26,6 +26,23 @@ function jobStatus(workspace, id) {
   return json(workspace.companion(["status", id, "--json"], { env: LEASE_ENV })).job;
 }
 
+function readBrokerLog(job) {
+  const logFile = path.join(path.dirname(path.dirname(job.logFile)), "broker.log");
+  try {
+    return fs.readFileSync(logFile, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  }
+}
+
+function workspaceJobFile(workspace, id) {
+  const root = path.join(workspace.home, "plugin-data", "state");
+  const stateName = fs.readdirSync(root).find((name) => fs.existsSync(path.join(root, name, "jobs", `${id}.json`)));
+  assert.ok(stateName, `missing state directory for job ${id}`);
+  return path.join(root, stateName, "jobs", `${id}.json`);
+}
+
 async function waitTerminal(workspace, id, timeoutMs = 6000) {
   await waitFor(() => {
     const job = jobStatus(workspace, id);
@@ -143,7 +160,8 @@ test("background task with an owner PID does not detach its broker turn", async 
   const job = jobStatus(workspace, id);
   assert.equal(job.owner.kind, "pid");
   assert.notEqual(job.owner.brokerDetached, true);
-  assert.equal(readFakeRpcLog(workspace.binDir, { method: "broker/markDetached" }).length, 0);
+  const brokerLog = readBrokerLog(job);
+  assert.doesNotMatch(brokerLog, new RegExp(`Marked broker thread ${job.threadId} detached\\.`));
   const starts = readFakeRpcLog(workspace.binDir, { method: "turn/start", dir: "out" });
   assert.ok(starts.length > 0);
   assert.equal(starts.some((entry) => entry.params?.brokerDetached === true), false);
@@ -253,6 +271,20 @@ test("broker interrupts a turn when its worker socket disconnects", async (t) =>
   child.kill("SIGKILL");
 });
 
+test("unowned background worker disconnect keeps broker interruption enabled", async (t) => {
+  const workspace = await makeCompanionWorkspace("review-ok", { fakeOptions: { turnScript: LONG_TURN } });
+  t.after(() => cleanWorkspace(workspace));
+  const launched = workspace.companion(["task", "--background", "--json", "kill unowned worker"], { env: LEASE_ENV });
+  assert.equal(launched.status, 0, launched.stderr);
+  const id = JSON.parse(launched.stdout).jobId;
+  await waitFor(() => Boolean(jobStatus(workspace, id).turnId), { timeoutMs: 6000 });
+  const job = jobStatus(workspace, id);
+  assert.equal(job.owner.kind, "none");
+  assert.ok(job.worker.pid);
+  process.kill(job.worker.pid, "SIGKILL");
+  await waitFor(() => readFakeRpcLog(workspace.binDir, { method: "turn/interrupt" }).length > 0, { timeoutMs: 2000 });
+});
+
 test("broker interrupts a turn when the worker dies while turn/start is pending", async (t) => {
   const workspace = await makeCompanionWorkspace("review-ok", {
     fakeOptions: { delays: { turnStart: 500 }, turnScript: LONG_TURN }
@@ -291,25 +323,40 @@ test("attach combined with background remains broker-owned", async (t) => {
   assert.equal(exitCode, 0);
   const id = stdout.match(/^CODEX_JOB (\S+)/m)?.[1];
   assert.ok(id);
-  assert.equal(jobStatus(workspace, id).owner.kind, "attach");
-  assert.equal(readFakeRpcLog(workspace.binDir, { method: "broker/markDetached" }).length, 0);
+  const job = jobStatus(workspace, id);
+  assert.equal(job.owner.kind, "attach");
+  const brokerLog = readBrokerLog(job);
+  assert.doesNotMatch(brokerLog, new RegExp(`Marked broker thread ${job.threadId} detached\\.`));
   const starts = readFakeRpcLog(workspace.binDir, { method: "turn/start", dir: "out" });
   assert.ok(starts.length > 0);
   assert.equal(starts.some((entry) => entry.params?.brokerDetached === true), false);
 });
 
 test("attach signal after completion preserves the completed exit code", async (t) => {
-  const workspace = await makeCompanionWorkspace("review-ok", { fakeOptions: { turnScript: [{ type: "delay", ms: 150 }] } });
+  const workspace = await makeCompanionWorkspace("review-ok", { fakeOptions: { turnScript: [{ type: "delay", ms: 1200 }] } });
   t.after(() => cleanWorkspace(workspace));
   const child = workspace.spawnCompanion(["task", "--attach", "--full-access", "completed before signal"], { env: LEASE_ENV });
   ensureKilledAfterTest(t, child);
   let stdout = "";
   child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
-  await waitFor(() => stdout.includes("CODEX_JOB "), { timeoutMs: 5000 });
+  await waitFor(() => stdout.includes("CODEX_JOB "), { timeoutMs: 10000 });
   const id = stdout.match(/^CODEX_JOB (\S+)/m)?.[1];
+  assert.ok(id);
+  const running = await waitFor(() => {
+    const job = jobStatus(workspace, id);
+    return job.status === "running" && job.threadId ? job : null;
+  }, { timeoutMs: 15000, intervalMs: 50 });
+  const jobFile = workspaceJobFile(workspace, id);
   process.kill(child.pid, "SIGSTOP");
-  await waitFor(() => jobStatus(workspace, id).status === "completed", { timeoutMs: 6000 });
   try {
+    await waitFor(() => {
+      try {
+        return JSON.parse(fs.readFileSync(jobFile, "utf8")).status === "completed";
+      } catch (error) {
+        if (error.code === "ENOENT") return false;
+        throw error;
+      }
+    }, { timeoutMs: 15000, intervalMs: 50 });
     child.kill("SIGTERM");
   } finally {
     process.kill(child.pid, "SIGCONT");
@@ -332,6 +379,22 @@ test("background task with an explicit owner PID does not print the unowned warn
   assert.equal(jobStatus(workspace, id).owner.kind, "pid");
 });
 
+test("setup default-on-detach configures the owner-exit policy for owned jobs", async (t) => {
+  const workspace = await makeCompanionWorkspace("review-ok", { fakeOptions: { turnScript: LONG_TURN } });
+  t.after(() => cleanWorkspace(workspace));
+  const setup = workspace.companion(["setup", "--default-on-detach", "continue", "--json"], { env: LEASE_ENV });
+  assert.equal(setup.status, 0, setup.stderr);
+  const owner = spawn("sleep", ["30"], { stdio: "ignore" });
+  t.after(() => { try { owner.kill("SIGKILL"); } catch {} });
+  const launched = workspace.companion(["task", "--background", "--owner-pid", String(owner.pid), "--full-access", "configured owner exit"], { env: LEASE_ENV });
+  assert.equal(launched.status, 0, launched.stderr);
+  const id = launched.stdout.match(/^CODEX_JOB_QUEUED id=(\S+)/m)?.[1];
+  assert.ok(id);
+  const job = jobStatus(workspace, id);
+  assert.equal(job.owner.kind, "pid");
+  assert.equal(job.onOwnerExit, "continue");
+});
+
 test("detached background task completes and reports an inactive detached owner", async (t) => {
   const workspace = await makeCompanionWorkspace("review-ok", { fakeOptions: { turnScript: [{ type: "delay", ms: 100 }] } });
   t.after(() => cleanWorkspace(workspace));
@@ -342,10 +405,13 @@ test("detached background task completes and reports an inactive detached owner"
   assert.ok(id);
   const queued = jobStatus(workspace, id);
   assert.equal(queued.owner.kind, "detached");
+  assert.equal(queued.onOwnerExit, "continue");
   assert.equal(queued.ownerAlive, false);
   assert.equal(queued.orphaned, false);
   const finished = await waitTerminal(workspace, id, 10000);
   assert.equal(finished.status, "completed");
+  const brokerLog = readBrokerLog(finished);
+  assert.match(brokerLog, new RegExp(`Marked broker thread ${finished.threadId} detached\\.`));
 });
 
 test("--owner-pid loss cancels a foreground task", async (t) => {
@@ -370,7 +436,7 @@ test("--owner-pid loss cancels a foreground task", async (t) => {
   assert.match(stdout, /Codex did not return a final message\./);
 });
 
-test("attach exit codes cover failed and cancelled jobs; timeout releases the lease", async (t) => {
+test("attach exit codes cover failed and cancelled jobs; timeout releases ownership without detaching", async (t) => {
   const failed = await makeCompanionWorkspace("review-ok", { fakeOptions: { turnScript: [], turnStatus: "failed" } });
   t.after(() => cleanWorkspace(failed));
   const failedRun = failed.companion(["task", "--attach", "failure"], { env: LEASE_ENV });
@@ -385,8 +451,10 @@ test("attach exit codes cover failed and cancelled jobs; timeout releases the le
   assert.ok(id);
   const job = jobStatus(long, id);
   assert.equal(job.status, "running");
-  assert.equal(job.owner.kind, "detached");
-  assert.equal(job.onOwnerExit, "continue");
+  assert.equal(job.owner.kind, "none");
+  assert.equal(job.onOwnerExit, "cancel");
+  const brokerLog = readBrokerLog(job);
+  assert.doesNotMatch(brokerLog, new RegExp(`Marked broker thread ${job.threadId} detached\\.`));
 
   const cancelled = await makeCompanionWorkspace("review-ok", { fakeOptions: { turnScript: LONG_TURN } });
   t.after(() => cleanWorkspace(cancelled));
@@ -420,8 +488,8 @@ test("attach timeout preserves worker thread and transport metadata", async (t) 
   assert.equal(job.status, "running");
   assert.ok(job.threadId);
   assert.equal(job.transport, "broker");
-  assert.equal(job.owner.kind, "detached");
-  assert.equal(job.onOwnerExit, "continue");
+  assert.equal(job.owner.kind, "none");
+  assert.equal(job.onOwnerExit, "cancel");
 });
 
 test("external cancellation keeps the fast control poll when owner polling is slow", async (t) => {
@@ -459,6 +527,15 @@ test("unowned background warns, and foreground SIGTERM interrupts its turn", asy
   assert.equal(launched.status, 0, launched.stderr);
   assert.match(launched.stderr, /Warning: job .* is unowned \(use --attach\)\. Stop it with: node scripts\/codex-companion\.mjs cancel /);
   assert.match(launched.stdout.split(/\r?\n/)[0], /^CODEX_JOB_QUEUED /);
+  const id = launched.stdout.match(/^CODEX_JOB_QUEUED id=(\S+)/m)?.[1];
+  assert.ok(id);
+  await waitFor(() => Boolean(jobStatus(workspace, id).threadId), { timeoutMs: 6000 });
+  const unowned = jobStatus(workspace, id);
+  assert.equal(unowned.owner.kind, "none");
+  assert.equal(unowned.onOwnerExit, "cancel");
+  assert.equal(unowned.status, "running", "unowned jobs have no owner-liveness check");
+  const brokerLog = readBrokerLog(unowned);
+  assert.doesNotMatch(brokerLog, new RegExp(`Marked broker thread ${unowned.threadId} detached\\.`));
 
   const foregroundWorkspace = await makeCompanionWorkspace("review-ok", { fakeOptions: { turnScript: LONG_TURN } });
   t.after(() => cleanWorkspace(foregroundWorkspace));

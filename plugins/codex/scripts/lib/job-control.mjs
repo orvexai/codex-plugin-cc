@@ -188,7 +188,7 @@ export function enrichJob(job, options = {}) {
     heartbeatAgeSec: liveness.heartbeatAgeSec,
     owner: job.owner ?? null,
     ownerAlive: ownerState.alive,
-    orphaned: isActiveJobStatus(job.status) && job.owner != null && !ownerState.alive && job.owner.kind !== "detached",
+    orphaned: isActiveJobStatus(job.status) && job.owner != null && job.owner.kind !== "none" && !ownerState.alive && job.owner.kind !== "detached",
     worker: { ...(job.worker ?? {}), ...(stderrPresent ? { stderrFile } : { stderrFile: undefined }) }
   });
   if (job.status === "lost" && stderrPresent) finalJob.errorMessage = `${job.errorMessage ?? "worker exited without completion record"} Worker stderr: ${stderrFile}`;
