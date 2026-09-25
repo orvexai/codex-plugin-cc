@@ -3,7 +3,7 @@
 - Source of requirements: `docs/IMPROVEMENT-REPORT.md` (the "report"). Item ids (BUG-n, FR-n, WISH-n) refer to it.
 - Tracker: beads (`bd`). Epics M0 `codex-plugin-cc-1mh`, M1 `-8kj`, M2 `-yew`, M3 `-e8s`, M4 `-wn9`, M5 `-qo4`, M6 `-22z`.
 - Executors: Codex worker lanes (gpt-6-luna, danger-full-access) editing the **shared** working tree `/home/crew/workspace/codex-plugin-cc` on branch `orvex/improvement-report`. The orchestrator dispatches from a pinned copy of the plugin, so editing `plugins/codex` is safe. Claude Sonnet reviewers check each lane; fixes return to the same Codex thread. The orchestrator commits and closes beads.
-- Lane briefs for M0 and M1: `docs/lanes/<lane-id>.md`. M2-M6 briefs are written when those milestones start, because their details depend on what M0 and M1 actually built.
+- Lane briefs: `docs/lanes/<lane-id>.md` for every lane of M0-M6. The M2-M6 briefs (§5) were written after the M0 spike and fixture landed; they reference M0/M1 modules by their planned names and tell each lane to read the merged code first. From M2 on, each lane runs in its own git worktree (§5).
 - Author: Winston (architect), 2026-09-25.
 
 ---
@@ -143,40 +143,109 @@ Heartbeats live in side files (`.hb`, `.owner.hb`), not in the record, which avo
 
 Critical path: fixture → liveness → cancel → ownership → completion-signal → runtime → bypass (7 waves). 13 lanes in M0+M1, with at most 4 running at once (W1).
 
-## 5. Lane DAG: M2-M6 (planned; briefs written at milestone start)
+## 5. Lane DAG: M2-M6 (final; briefs exist in `docs/lanes/`)
 
-The pattern is **library first, wiring second**: a new `lib/*.mjs` module plus its unit tests can run beside a companion-owning lane.
+Revised 2026-09-25 after the M0 spike (`docs/app-server-probe.md`, `docs/codex-native-surfaces.md`) and the M0 fixture landed. 41 lanes in 19 waves. All 37 remaining report items are covered: BUG-7, 9, 10, 11, 13, 15, 17; FR-2 to FR-24 and FR-27 (FR-16 and FR-25 are M1; FR-26 is M0); WISH-1 to WISH-7.
 
-| Wave | Lane | Items (beads) | Files owned (principal) | Depends on | Concurrent with |
+**Execution model.** Each lane runs in its own git worktree (`/home/crew/workspace/codex-plugin-cc-lanes/<lane-id>`, branch `lane/<lane-id>`), created from `orvex/improvement-report` after the previous wave is merged. Lanes of one wave run concurrently and own **disjoint files** (checked mechanically when the briefs were generated), so their merges do not conflict. Exactly one lane per wave owns `tests/fake-codex-fixture.mjs` + `tests/helpers.mjs`; the others write local helpers in their own test files. Waves run strictly in the order below, milestone by milestone; a wave starts only when every lane of the previous wave is merged and `npm test` is green on the work branch.
+
+**Library first, wiring second.** `codex-companion.mjs` is owned by at most one lane per wave. New `lib/*.mjs` modules (and their unit tests) are built in a wave where the companion is busy with something else, and wired in the next wave. From M5 onward every companion-owning lane also owns `lib/job-api.mjs`, the callable API extracted from the companion in `m5-job-api`.
+
+**Decisions taken from the probe (binding on the briefs):**
+- P1. No `thread/unload` exists (probe §6). BUG-11 drops "unload the thread"; follow-ups prefer resuming on the broker that holds the thread, and forks are recorded and resolved (`m3-resume`).
+- P2. `ThreadStartResponse` carries effective `model`, `reasoningEffort`, `sandbox`, `approvalPolicy`, `cwd` and `thread.path` (probe §4). BUG-10 reads them from the response (`m4-effective`); FR-7 records `thread.path` as `rolloutPath` (`m2-worker-idle`). A resumed thread can report a different sandbox than it started with (probe §6), so follow-ups send the inherited explicit sandbox and record the effective one.
+- P3. `developerInstructions` is verified; **no per-thread key disables skills, hooks or AGENTS.md** (probe §8). FR-13's `--skills/--hooks/--no-agents-md` are narrowed to *advisory* (developer-instruction lines + a `lanePolicy` record + `lane-context` reporting); the unverified candidate keys are never sent on the user's behalf (`m4-lane-lib`, `m4-lane`).
+- P4. Native `review/start` turns cannot be steered (probe §7): WISH-3 steering applies to adversarial-review jobs only; the BUG-17 nudge skips review turns.
+- P5. `codex queue` schedules a later turn and does not steer (native surfaces §2): not used for `send`, nudges or budgets.
+- P6. Keep the plugin broker; **no `daemon` transport** (native surfaces, Decision). D1's optional M6 daemon transport is dropped from `m6-broker-lib`.
+- P7. `model/list` is cursor-paginated with `supportedReasoningEfforts`/`defaultReasoningEffort`/`isDefault` (probe §1); `config/read` returns `config` + `origins` (probe §2). FR-12, BUG-9 and FR-15 build on these shapes.
+- P8. The runtime has no npm dependencies: JSON Schema validation (`lib/json-schema.mjs`) and the MCP stdio server (`lib/mcp-protocol.mjs`) are hand-written.
+
+**Other scope decisions recorded in the briefs:** FR-9's optional `{op:"continue"}` after natural completion is not implemented (follow-up jobs remain); `defaultLaunch` defaults to `foreground` and `defaultResume` to `ask` (today's behaviour; §8.4 lists example values); `defaultIsolation` is stored in M4 and enforced from M6; BUG-15's overlap warning is exercised with `--shared-tree` because FR-6's lease otherwise refuses the second writer; WISH-3's "model invoked the command" cannot be detected in a command body, so model calls must pass a run-mode flag; FR-27's downstream houston change is reported, not made; token-cost criteria (BUG-4, FR-19, FR-23) remain manual measurements.
+
+### 5.1 Wave table
+
+| Wave | Lane | Beads (`codex-plugin-cc-…`) | Items | Files owned (runtime paths relative to `plugins/codex/scripts/`) | Depends on |
 |---|---|---|---|---|---|
-| M2-a | `m2-events` | FR-2, WISH-1 (yew.1, yew.2) | `lib/events.mjs` (new), `lib/tracked-jobs.mjs`, `lib/codex.mjs` (describe* full text), `codex-companion.mjs` (`events`, `logs`), `tests/events.test.mjs` | M1 | `m2-snapshot-lib` |
-| M2-a | `m2-snapshot-lib` | FR-5 library half (yew.4) | `lib/git-snapshot.mjs` (new), `lib/git.mjs`, `tests/git-snapshot.test.mjs` | M1 | `m2-events` |
-| M2-b | `m2-capture` | FR-3 (yew.3) | `lib/codex.mjs` (`applyTurnNotification`), `lib/app-server.mjs` (opt-out list), `lib/job-control.mjs`, `tests/capture.test.mjs` | m2-events | `m2-report-lib` |
-| M2-b | `m2-report-lib` | FR-4 library half (yew.5) | `lib/task-report.mjs` (new), `schemas/task-report.schema.json`, `schemas/task-result.schema.json`, `tests/task-report.test.mjs` | m2-snapshot-lib | `m2-capture` |
-| M2-c | `m2-report` | FR-4 + FR-5 wiring, `diff`, `--output-schema`, `--expect-changes` | `codex-companion.mjs`, `lib/render.mjs`, `tests/report.test.mjs` | m2-capture, m2-report-lib | none |
-| M2-d | `m2-transcript` | FR-7 (yew.6) | `lib/transcript.mjs` (new), `codex-companion.mjs`, `tests/transcript.test.mjs` | m2-report, PROBE | none |
-| M2-e | `m2-partial` | FR-8, BUG-17 (yew.7, yew.8) | `lib/job-control.mjs`, `codex-companion.mjs`, `lib/codex.mjs` (idle nudge), `tests/partial.test.mjs` | m2-transcript | none |
-| M3-a | `m3-resume` | BUG-7, BUG-11, FR-21 (e8s.1-3) | `lib/args.mjs` (optional value), `codex-companion.mjs`, `lib/codex.mjs`, `app-server-broker.mjs` (unload), `tests/resume.test.mjs` | M2 | `m3-reattach-hook` |
-| M3-a | `m3-reattach-hook` | FR-10 hook half (e8s.5) | `session-lifecycle-hook.mjs` (SessionStart context), `tests/session-start.test.mjs` | M2 | `m3-resume` |
-| M3-b | `m3-interrupt` | FR-9 (e8s.4) + `/codex:interrupt` + drive-skill update | `lib/codex.mjs`, `lib/control-channel.mjs`, `codex-companion.mjs`, `commands/interrupt.md`, `skills/codex-drive/SKILL.md`, `tests/interrupt.test.mjs` | m3-resume | none |
-| M3-c | `m3-reattach` | FR-10 CLI half (`attach`, `adopt`, `status --all-sessions`) | `codex-companion.mjs`, `lib/job-control.mjs`, `commands/attach.md`, `tests/reattach.test.mjs` | m3-interrupt | none |
-| M3-d | `m3-send-budget` | FR-20, FR-17 (e8s.6, e8s.7) | `codex-companion.mjs`, `lib/codex.mjs`, `tests/send-budget.test.mjs` | m3-reattach | none |
-| M4-a | `m4-models` | FR-12, BUG-9, BUG-10 (wn9.1-3) | `lib/models.mjs` (new), `codex-companion.mjs`, `lib/codex.mjs`, `lib/render.mjs`, `commands/models.md`, `tests/models.test.mjs` | M3, PROBE | `m4-lane-lib` |
-| M4-a | `m4-lane-lib` | FR-13 library half (wn9.4) | `lib/lane-config.mjs` (new; TOML `-c` parsing, deep-merge, preamble), `prompts/delegated-worker.md`, `tests/lane-config.test.mjs` | PROBE, FR-26 | `m4-models` |
-| M4-b | `m4-lane` | FR-13 wiring + `lane-context` | `codex-companion.mjs`, `lib/codex.mjs`, `tests/lane.test.mjs` | m4-models, m4-lane-lib | none |
-| M4-c | `m4-config` | FR-14, FR-15 (wn9.5, wn9.6) | `lib/config.mjs` (new layered resolver), `lib/state.mjs`, `codex-companion.mjs`, `commands/rescue.md`, `tests/config.test.mjs` | m4-lane | none |
-| M5-a | `m5-mcp` | FR-11 (qo4.1) | `scripts/mcp-server.mjs` (new), `.mcp.json`, `codex-companion.mjs` (`mcp` subcommand only), `tests/mcp.test.mjs` | M4 | `m5-fanout-lib` |
-| M5-a | `m5-fanout-lib` | FR-18 scheduler half (qo4.4) | `lib/fanout.mjs` (new), `tests/fanout-lib.test.mjs` | M4 | `m5-mcp` |
-| M5-b | `m5-fanout-brief` | FR-18 wiring, FR-23 (qo4.3) | `codex-companion.mjs`, `lib/render.mjs`, `tests/fanout.test.mjs`, `tests/brief.test.mjs` | m5-mcp, m5-fanout-lib | `m5-workflow` |
-| M5-b | `m5-workflow` | FR-19 (qo4.2) | `agents/codex-exec.md`, `skills/codex-workflow/**`, `tests/fixtures/workflow/**`, `tests/workflow.test.mjs` | m5-mcp | `m5-fanout-brief` |
-| M5-c | `m5-docs` | FR-27 (qo4.5) | `codex-companion.mjs` (`--print-claude-md`, `--install-mcp`), `tests/claude-md.test.mjs` | m5-fanout-brief, m5-workflow | none |
-| M6-a | `m6-worktree` | FR-6, BUG-15 (22z.1, 22z.2) | `lib/worktree.mjs` (new), `codex-companion.mjs`, `lib/job-control.mjs`, `tests/worktree.test.mjs` | M5 | `m6-ci` |
-| M6-a | `m6-ci` | FR-24 (22z.6) | `.github/workflows/*`, `tests/contract.test.mjs`, `tests/doc-consistency.test.mjs` | FIXTURE, PROBE (can be pulled forward to any wave) | anything |
-| M6-b | `m6-ops` | FR-22, BUG-13 (+ optional `daemon` transport per D1) (22z.3, 22z.4) | `app-server-broker.mjs`, `lib/broker-lifecycle.mjs`, `lib/app-server.mjs`, `lib/codex.mjs`, `codex-companion.mjs` (`broker`), `tests/broker-ops.test.mjs` | m6-worktree | `m6-ci` |
-| M6-c | `m6-rails` | WISH-2, WISH-7 (22z.5, 22z.11) | `codex-companion.mjs`, `lib/state.mjs`, `lib/render.mjs`, `tests/rails.test.mjs` | m6-ops | `m6-ci` |
-| M6-d | `m6-wishes` | WISH-3, WISH-4, WISH-5, WISH-6 (22z.7-10) | split into 2 lanes at the time (reviews vs models/prompting) | m6-rails | — |
+| M2-W1 | [`m2-events`](lanes/m2-events.md) | yew.1, yew.2 | FR-2, WISH-1 | `lib/events.mjs`, `lib/tracked-jobs.mjs`, `lib/codex.mjs`, `codex-companion.mjs`, `commands/logs.md`, `skills/codex-drive/SKILL.md` + fixture/helpers; tests: `tests/commands.test.mjs`, `tests/events.test.mjs` | all of M0 and M1 merged |
+| M2-W1 | [`m2-snapshot-lib`](lanes/m2-snapshot-lib.md) | yew.4 | FR-5 | `lib/git-snapshot.mjs`; tests: `tests/git-snapshot.test.mjs` | all of M0 and M1 merged |
+| M2-W1 | [`m2-report-lib`](lanes/m2-report-lib.md) | yew.5 | FR-4 | `lib/task-report.mjs`, `lib/json-schema.mjs`, `schemas/task-report.schema.json`, `schemas/task-result.schema.json`; tests: `tests/task-report.test.mjs` | all of M0 and M1 merged |
+| M2-W1 | [`m2-transcript-lib`](lanes/m2-transcript-lib.md) | yew.6 | FR-7 | `lib/transcript.mjs`; tests: `tests/transcript-lib.test.mjs`, `tests/fixtures/rollouts/` | all of M0 and M1 merged; the event schema in brief `docs/lanes/m2-events.md` (read its "Design decisions"; `m2-events` runs concurrently, so code against that schema, not against its implementation) |
+| M2-W2 | [`m2-capture`](lanes/m2-capture.md) | yew.3 | FR-3 | `lib/codex.mjs`, `lib/app-server.mjs`, `lib/tracked-jobs.mjs`, `lib/job-control.mjs`, `lib/render.mjs` + fixture/helpers; tests: `tests/capture.test.mjs` | wave 1 (`m2-events` merged: event writer and schema) |
+| M2-W2 | [`m2-report`](lanes/m2-report.md) | yew.5, yew.4 | FR-4, FR-5 | `codex-companion.mjs`, `lib/task-report.mjs`, `lib/json-schema.mjs`, `lib/git-snapshot.mjs`, `schemas/task-report.schema.json`, `schemas/task-result.schema.json`; tests: `tests/report.test.mjs` | wave 1 (`m2-events`, `m2-snapshot-lib`, `m2-report-lib` merged) |
+| M2-W3 | [`m2-worker-idle`](lanes/m2-worker-idle.md) | yew.8, yew.6 | BUG-17, FR-7 | `lib/codex.mjs`, `lib/tracked-jobs.mjs`, `lib/job-liveness.mjs` + fixture/helpers; tests: `tests/idle.test.mjs` | wave 2 (`m2-capture`, `m2-report` merged) |
+| M2-W3 | [`m2-status-lib`](lanes/m2-status-lib.md) | yew.7, yew.8 | FR-8, BUG-17 | `lib/partial-result.mjs`, `lib/job-control.mjs`, `lib/render.mjs`; tests: `tests/status-lib.test.mjs` | wave 2 (`m2-capture`, `m2-report` merged) |
+| M2-W4 | [`m2-inspect`](lanes/m2-inspect.md) | yew.6, yew.7, yew.3 | FR-7, FR-8, FR-3 | `codex-companion.mjs`, `lib/codex.mjs`, `lib/transcript.mjs`, `lib/partial-result.mjs`, `lib/render.mjs`, `commands/status.md`, `skills/codex-drive/SKILL.md` + fixture/helpers; tests: `tests/inspect.test.mjs` | wave 3 (`m2-worker-idle`, `m2-status-lib` merged) and wave 1 (`m2-transcript-lib`) |
+| M3-W1 | [`m3-resume`](lanes/m3-resume.md) | e8s.1, e8s.2, e8s.3 | BUG-7, BUG-11, FR-21 | `lib/args.mjs`, `codex-companion.mjs`, `lib/codex.mjs`, `lib/thread-forks.mjs`, `lib/render.mjs`, `lib/tracked-jobs.mjs`, `commands/rescue.md`, `skills/codex-drive/SKILL.md`, `skills/codex-cli-runtime/SKILL.md`, `CHANGELOG.md` + fixture/helpers; tests: `tests/resume.test.mjs`, `tests/orvex.test.mjs` | all of M2 merged |
+| M3-W1 | [`m3-session-start`](lanes/m3-session-start.md) | e8s.5 | FR-10 | `session-lifecycle-hook.mjs`, `lib/session-context.mjs`; tests: `tests/session-start.test.mjs`, `tests/fixtures/session-start/` | all of M2 merged |
+| M3-W1 | [`m3-control-lib`](lanes/m3-control-lib.md) | e8s.4, e8s.7, e8s.6 | FR-9, FR-17, FR-20 | `lib/control-channel.mjs`, `lib/job-budget.mjs`, `lib/message-ledger.mjs`; tests: `tests/control-lib.test.mjs` | all of M2 merged |
+| M3-W2 | [`m3-control`](lanes/m3-control.md) | e8s.4, e8s.7 | FR-9, FR-17 | `codex-companion.mjs`, `lib/codex.mjs`, `lib/tracked-jobs.mjs`, `lib/control-channel.mjs`, `lib/job-budget.mjs`, `lib/render.mjs`, `commands/interrupt.md`, `skills/codex-drive/SKILL.md` + fixture/helpers; tests: `tests/commands.test.mjs`, `tests/interrupt.test.mjs`, `tests/budget.test.mjs` | wave 1 (`m3-resume`, `m3-session-start`, `m3-control-lib` merged) |
+| M3-W2 | [`m3-reattach-lib`](lanes/m3-reattach-lib.md) | e8s.5 | FR-10 | `lib/job-control.mjs`, `lib/job-adopt.mjs`; tests: `tests/reattach-lib.test.mjs` | wave 1 merged |
+| M3-W3 | [`m3-reattach-send`](lanes/m3-reattach-send.md) | e8s.5, e8s.6 | FR-10, FR-20 | `codex-companion.mjs`, `lib/codex.mjs`, `lib/message-ledger.mjs`, `lib/job-adopt.mjs`, `lib/job-control.mjs`, `lib/render.mjs`, `lib/session-context.mjs`, `commands/attach.md`, `commands/messages.md`, `commands/send.md`, `skills/codex-drive/SKILL.md` + fixture/helpers; tests: `tests/commands.test.mjs`, `tests/reattach.test.mjs`, `tests/messages.test.mjs` | wave 2 (`m3-control`, `m3-reattach-lib` merged) |
+| M4-W1 | [`m4-models-lib`](lanes/m4-models-lib.md) | wn9.1, wn9.2 | FR-12, BUG-9 | `lib/models.mjs`; tests: `tests/models-lib.test.mjs` | all of M3 merged |
+| M4-W1 | [`m4-lane-lib`](lanes/m4-lane-lib.md) | wn9.4 | FR-13 | `lib/lane-config.mjs`, `prompts/delegated-worker.md`; tests: `tests/lane-config.test.mjs` | all of M3 merged |
+| M4-W1 | [`m4-config-lib`](lanes/m4-config-lib.md) | wn9.5, wn9.6 | FR-14, FR-15 | `lib/config.mjs`; tests: `tests/config-lib.test.mjs` | all of M3 merged |
+| M4-W1 | [`m4-effective`](lanes/m4-effective.md) | wn9.3 | BUG-10 | `lib/codex.mjs`, `lib/tracked-jobs.mjs`, `lib/render.mjs` + fixture/helpers; tests: `tests/effective-runtime.test.mjs` | all of M3 merged |
+| M4-W2 | [`m4-models`](lanes/m4-models.md) | wn9.1, wn9.2 | FR-12, BUG-9 | `codex-companion.mjs`, `lib/models.mjs`, `lib/render.mjs`, `commands/models.md`, `commands/rescue.md`, `agents/codex-rescue.md`, `skills/codex-cli-runtime/SKILL.md`, `skills/codex-drive/SKILL.md`, `README.md` + fixture/helpers; tests: `tests/commands.test.mjs`, `tests/models.test.mjs` | wave 1 (`m4-models-lib`, `m4-lane-lib`, `m4-config-lib`, `m4-effective` merged) |
+| M4-W3 | [`m4-lane`](lanes/m4-lane.md) | wn9.4 | FR-13 | `codex-companion.mjs`, `lib/codex.mjs`, `lib/args.mjs`, `lib/lane-config.mjs`, `prompts/delegated-worker.md`, `skills/codex-drive/SKILL.md` + fixture/helpers; tests: `tests/lane.test.mjs`, `tests/orvex.test.mjs`, `tests/runtime.test.mjs` | wave 2 (`m4-models` merged) |
+| M4-W4 | [`m4-config`](lanes/m4-config.md) | wn9.5, wn9.6 | FR-14, FR-15 | `codex-companion.mjs`, `lib/config.mjs`, `lib/state.mjs`, `lib/render.mjs`, `lib/claude-md.mjs`, `stop-review-gate-hook.mjs`, `commands/rescue.md`, `commands/setup.md`, `skills/codex-drive/SKILL.md`, `README.md` + fixture/helpers; tests: `tests/config.test.mjs`, `tests/claude-md.test.mjs` | wave 3 (`m4-lane` merged) |
+| M5-W1 | [`m5-job-api`](lanes/m5-job-api.md) | qo4.1, qo4.2 | FR-11, FR-19 | `codex-companion.mjs`, `lib/job-api.mjs` + fixture/helpers; tests: `tests/job-api.test.mjs` | all of M4 merged |
+| M5-W1 | [`m5-fanout-lib`](lanes/m5-fanout-lib.md) | qo4.4 | FR-18 | `lib/fanout.mjs`; tests: `tests/fanout-lib.test.mjs` | all of M4 merged |
+| M5-W1 | [`m5-brief-lib`](lanes/m5-brief-lib.md) | qo4.3 | FR-23 | `lib/brief-format.mjs`; tests: `tests/brief-lib.test.mjs` | all of M4 merged |
+| M5-W1 | [`m5-mcp-protocol`](lanes/m5-mcp-protocol.md) | qo4.1 | FR-11 | `lib/mcp-protocol.mjs`; tests: `tests/mcp-protocol.test.mjs` | all of M4 merged |
+| M5-W2 | [`m5-mcp`](lanes/m5-mcp.md) | qo4.1 | FR-11 | `mcp-server.mjs`, `lib/mcp-tools.mjs`, `lib/mcp-protocol.mjs`, `.mcp.json`; tests: `tests/mcp.test.mjs` | wave 1 (`m5-job-api`, `m5-fanout-lib`, `m5-brief-lib`, `m5-mcp-protocol` merged) |
+| M5-W2 | [`m5-fanout-brief`](lanes/m5-fanout-brief.md) | qo4.4, qo4.3 | FR-18, FR-23 | `codex-companion.mjs`, `lib/job-api.mjs`, `lib/fanout.mjs`, `lib/brief-format.mjs`, `lib/codex.mjs`, `lib/tracked-jobs.mjs`, `lib/render.mjs` + fixture/helpers; tests: `tests/fanout.test.mjs`, `tests/brief.test.mjs` | wave 1 merged |
+| M5-W2 | [`m5-workflow`](lanes/m5-workflow.md) | qo4.2 | FR-19 | `agents/codex-exec.md`, `skills/codex-workflow/SKILL.md`; tests: `tests/fixtures/workflow/`, `tests/workflow.test.mjs` | wave 1 merged (`--progress-stderr`, the job API) |
+| M5-W3 | [`m5-docs`](lanes/m5-docs.md) | qo4.5, qo4.3, qo4.4 | FR-27, FR-23, FR-18 | `codex-companion.mjs`, `lib/job-api.mjs`, `lib/claude-md.mjs`, `lib/config.mjs`, `lib/mcp-tools.mjs`, `commands/rescue.md`, `commands/result.md`, `skills/codex-result-handling/SKILL.md`, `skills/codex-drive/SKILL.md`, `skills/codex-workflow/SKILL.md`, `README.md` + fixture/helpers; tests: `tests/fixtures/delegation/`, `tests/commands.test.mjs`, `tests/claude-md.test.mjs`, `tests/delegation.test.mjs` | wave 2 (`m5-mcp`, `m5-fanout-brief`, `m5-workflow` merged) |
+| M6-W1 | [`m6-worktree-lib`](lanes/m6-worktree-lib.md) | 22z.1 | FR-6 | `lib/worktree.mjs`, `lib/tree-lease.mjs`; tests: `tests/worktree-lib.test.mjs` | all of M5 merged |
+| M6-W1 | [`m6-broker-lib`](lanes/m6-broker-lib.md) | 22z.3, 22z.4 | FR-22, BUG-13 | `app-server-broker.mjs`, `lib/broker-lifecycle.mjs`, `lib/app-server.mjs`, `lib/codex.mjs`, `lib/tracked-jobs.mjs` + fixture/helpers; tests: `tests/broker-lib.test.mjs`, `tests/error-surfacing.test.mjs` | all of M5 merged |
+| M6-W1 | [`m6-ci`](lanes/m6-ci.md) | 22z.6 | FR-24 | `.github/workflows/pull-request-ci.yml`, `.github/workflows/nightly.yml`, `scripts/check-doc-consistency.mjs`; tests: `tests/doc-consistency.test.mjs`, `tests/contract.test.mjs`, `tests/fixtures/doc-consistency-allowlist.json` | none strictly (best after M5, so the doc check sees the final docs) |
+| M6-W1 | [`m6-history-lib`](lanes/m6-history-lib.md) | 22z.11 | WISH-7 | `lib/archive.mjs`, `lib/state.mjs`; tests: `tests/archive.test.mjs` | all of M5 merged |
+| M6-W1 | [`m6-prompting`](lanes/m6-prompting.md) | 22z.10 | WISH-6 | `skills/gpt-5-4-prompting/`, `skills/codex-prompting/`, `agents/codex-rescue.md`, `agents/codex-exec.md`, `commands/rescue.md`; tests: `tests/commands.test.mjs` | all of M5 merged |
+| M6-W1 | [`m6-escalation-lib`](lanes/m6-escalation-lib.md) | 22z.8 | WISH-4 | `lib/escalation.mjs`; tests: `tests/escalation-lib.test.mjs` | all of M5 merged |
+| M6-W2 | [`m6-isolation`](lanes/m6-isolation.md) | 22z.1, 22z.2 | FR-6, BUG-15 | `codex-companion.mjs`, `lib/job-api.mjs`, `lib/job-control.mjs`, `lib/render.mjs`, `lib/workspace.mjs`, `lib/worktree.mjs`, `lib/tree-lease.mjs`, `lib/tracked-jobs.mjs`, `lib/mcp-tools.mjs`, `skills/codex-drive/SKILL.md`, `README.md`; tests: `tests/orvex.test.mjs`, `tests/isolation.test.mjs`, `tests/overlap.test.mjs` | wave 1 (`m6-worktree-lib`, `m6-broker-lib`, `m6-ci`, `m6-history-lib`, `m6-prompting`, `m6-escalation-lib` merged) |
+| M6-W2 | [`m6-approval-worker`](lanes/m6-approval-worker.md) | 22z.9 | WISH-5 | `lib/app-server.mjs`, `lib/codex.mjs`, `lib/approvals.mjs`, `app-server-broker.mjs` + fixture/helpers; tests: `tests/approvals-lib.test.mjs` | wave 1 merged |
+| M6-W3 | [`m6-ops`](lanes/m6-ops.md) | 22z.3, 22z.4, 22z.11 | FR-22, BUG-13, WISH-7 | `codex-companion.mjs`, `lib/job-api.mjs`, `lib/render.mjs`, `lib/job-control.mjs`, `lib/archive.mjs`, `lib/broker-lifecycle.mjs`, `lib/config.mjs`, `agents/codex-rescue.md`, `skills/codex-drive/SKILL.md` + fixture/helpers; tests: `tests/ops.test.mjs`, `tests/history.test.mjs` | wave 2 (`m6-isolation`, `m6-approval-worker` merged) |
+| M6-W4 | [`m6-rails`](lanes/m6-rails.md) | 22z.5, 22z.8 | WISH-2, WISH-4 | `codex-companion.mjs`, `lib/job-api.mjs`, `lib/render.mjs`, `lib/job-control.mjs`, `lib/tracked-jobs.mjs`, `lib/escalation.mjs`, `lib/config.mjs`, `lib/mcp-tools.mjs`, `skills/codex-drive/SKILL.md` + fixture/helpers; tests: `tests/rails.test.mjs`, `tests/escalation.test.mjs` | wave 3 (`m6-ops` merged) |
+| M6-W5 | [`m6-reviews`](lanes/m6-reviews.md) | 22z.7, 22z.9 | WISH-3, WISH-5 | `codex-companion.mjs`, `lib/job-api.mjs`, `lib/codex.mjs`, `lib/tracked-jobs.mjs`, `lib/approvals.mjs`, `lib/mcp-tools.mjs`, `lib/render.mjs`, `commands/review.md`, `commands/adversarial-review.md`, `skills/codex-drive/SKILL.md` + fixture/helpers; tests: `tests/commands.test.mjs`, `tests/reviews.test.mjs`, `tests/approvals.test.mjs` | wave 4 (`m6-rails` merged) |
 
-`m6-ci` (FR-24) touches only `.github/` and new test files. The orchestrator may run it in **any** wave as a free concurrent lane, and it is a good candidate for W2 or W3, where otherwise only one lane runs.
+### 5.2 Waves at a glance (lanes in one row run concurrently)
+
+| Wave | Concurrent lanes | Why this order |
+|---|---|---|
+| M2-W1 | `m2-events`, `m2-snapshot-lib`, `m2-report-lib`, `m2-transcript-lib` | The event schema plus three pure libraries; only `m2-events` touches the companion |
+| M2-W2 | `m2-capture`, `m2-report` | Capture needs the event writer; the report wiring needs both W1 libraries |
+| M2-W3 | `m2-worker-idle`, `m2-status-lib` | Worker-side idle/rollout vs. snapshot/render side; both need W2's captured data |
+| M2-W4 | `m2-inspect` | CLI for transcript, partial results and status flags on top of W1-W3 |
+| M3-W1 | `m3-resume`, `m3-session-start`, `m3-control-lib` | Resume/fork owns the companion; the hook and control libraries are disjoint |
+| M3-W2 | `m3-control`, `m3-reattach-lib` | `interrupt --then` and budgets need the control library and BUG-7's resume; adoption library is disjoint |
+| M3-W3 | `m3-reattach-send` | `attach`/`adopt`/`messages`/`unsend` need the adoption library and the message ledger |
+| M4-W1 | `m4-models-lib`, `m4-lane-lib`, `m4-config-lib`, `m4-effective` | Three pure libraries plus BUG-10 in the worker layer (no companion) |
+| M4-W2 | `m4-models` | Model/effort validation in every command |
+| M4-W3 | `m4-lane` | Lane flags reuse the model-validated flag parsing |
+| M4-W4 | `m4-config` | Centralises every key (including M4-W2/W3's) and profiles |
+| M5-W1 | `m5-job-api`, `m5-fanout-lib`, `m5-brief-lib`, `m5-mcp-protocol` | Extract the callable job API; three pure libraries |
+| M5-W2 | `m5-mcp`, `m5-fanout-brief`, `m5-workflow` | MCP server (no companion), fan-out/brief/`mcp` subcommand (companion), Workflow docs |
+| M5-W3 | `m5-docs` | Delegation docs need the real tool list; `codex_fanout` needs fan-out |
+| M6-W1 | `m6-worktree-lib`, `m6-broker-lib`, `m6-ci`, `m6-history-lib`, `m6-prompting`, `m6-escalation-lib` | Libraries, broker/transport layer, CI and docs; no companion |
+| M6-W2 | `m6-isolation`, `m6-approval-worker` | Worktrees/lease/overlap (companion) vs. approval bridge (transport) |
+| M6-W3 | `m6-ops` | `broker`, Warnings, `gc`/`history` CLI |
+| M6-W4 | `m6-rails` | `cancel --all`, badges, lease requirement, escalation wiring |
+| M6-W5 | `m6-reviews` | Tracked reviews and the approval CLI (needs W2's bridge) |
+
+`m6-ci` touches only `.github/`, `scripts/check-doc-consistency.mjs` and new test files, so the orchestrator may pull it into any earlier wave as a filler; its doc check is most useful after M5. Critical path: 19 waves; the widest waves are M6-W1 (6 lanes) and M2-W1, M4-W1, M5-W1 (4 lanes each).
+
+### 5.3 Shared-file ownership across M2-M6 (by wave)
+
+| File | Owning lane per wave |
+|---|---|
+| `codex-companion.mjs` | m2-events (W1) → m2-report (W2) → m2-inspect (W4) → m3-resume → m3-control → m3-reattach-send → m4-models → m4-lane → m4-config → m5-job-api → m5-fanout-brief → m5-docs → m6-isolation → m6-ops → m6-rails → m6-reviews |
+| `lib/codex.mjs` | m2-events → m2-capture → m2-worker-idle → m2-inspect → m3-resume → m3-control → m3-reattach-send → m4-effective → m4-lane → m5-fanout-brief → m6-broker-lib → m6-approval-worker → m6-reviews |
+| `lib/tracked-jobs.mjs` | m2-events → m2-capture → m2-worker-idle → m3-resume → m3-control → m4-effective → m5-fanout-brief → m6-broker-lib → m6-isolation → m6-rails → m6-reviews |
+| `lib/render.mjs` | m2-capture → m2-status-lib → m2-inspect → m3-resume → m3-control → m3-reattach-send → m4-effective → m4-models → m4-config → m5-fanout-brief → m6-isolation → m6-ops → m6-rails → m6-reviews |
+| `lib/job-control.mjs` | m2-capture → m2-status-lib → m3-reattach-lib → m3-reattach-send → m6-isolation → m6-ops → m6-rails |
+| `skills/codex-drive/SKILL.md` | one lane per wave that adds commands (see each brief) |
+| fixture + helpers | exactly one lane per wave (the brief header says which) |
 
 ---
 
