@@ -16,6 +16,7 @@ import {
     getSessionRuntimeStatus,
     importExternalAgentSession,
     interruptAppServerTurn,
+    markBrokerThreadDetached,
     waitForAppServerThreadStop,
     parseStructuredOutput,
     readOutputSchema,
@@ -25,9 +26,9 @@ import {
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, isSameProcess, terminateProcessTree, terminateProcessTreeVerified } from "./lib/process.mjs";
+import { binaryAvailable, isSameProcess, readProcessStartTime, terminateProcessTree, terminateProcessTreeVerified } from "./lib/process.mjs";
 import { EXIT, exitCodeForJob, isActiveJobStatus } from "./lib/exit-codes.mjs";
-import { reconcileJob, reconcileJobDeep } from "./lib/job-liveness.mjs";
+import { assessOwner, reconcileJob, reconcileJobDeep, resolveHeartbeatFile, startHeartbeat } from "./lib/job-liveness.mjs";
 import { ackControlOp, appendControlOp, readControlAck, resolveControlFile, waitForControlAck } from "./lib/control-channel.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
@@ -119,7 +120,7 @@ const USAGE = {
     "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
   ],
   task: [
-    "  node scripts/codex-companion.mjs task [--background] [--write|--read-only|--full-access|--sandbox <read-only|workspace-write|danger-full-access>] [--network|--no-network] [--name <label>] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--cwd <dir>] [--prompt-file <file>] [prompt]",
+    "  node scripts/codex-companion.mjs task [--attach|--background] [--detach] [--on-owner-exit cancel|continue] [--owner-pid <pid>] [--timeout-ms <n>] [--write|--read-only|--full-access|--sandbox <read-only|workspace-write|danger-full-access>] [--network|--no-network] [--name <label>] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--cwd <dir>] [--prompt-file <file>] [prompt]",
   ],
   send: [
     "  node scripts/codex-companion.mjs send <job-id> [--background] [--timeout-ms <ms>] [--no-follow-up] [--prompt-file <file>] [message]",
@@ -430,7 +431,7 @@ function applyDefaultOption(options, optionName, apply) {
 
 async function handleSetup(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "default-model", "default-effort", "default-sandbox", "default-network", "bin-dir"],
+    valueOptions: ["cwd", "default-model", "default-effort", "default-sandbox", "default-network", "default-on-detach", "bin-dir"],
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate", "global", "install-cli"]
   });
 
@@ -475,6 +476,13 @@ async function handleSetup(argv) {
       writeDefault(key, value);
       actionsTaken.push(`Set the ${scopeLabel} default ${label} to ${value}.`);
     });
+  }
+
+  if (options["default-on-detach"] !== undefined) {
+    const value = String(options["default-on-detach"]).toLowerCase();
+    if (!["cancel", "continue"].includes(value)) throw new Error("--default-on-detach must be cancel or continue.");
+    writeDefault("onOwnerExit", value);
+    actionsTaken.push(`Set the ${scopeLabel} default on detach to ${value}.`);
   }
 
   if (options["install-cli"]) {
@@ -767,6 +775,10 @@ async function executeTaskRun(request) {
     controlFile: request.jobId ? resolveControlFile(workspaceRoot, request.jobId) : null,
     workspaceRoot,
     jobId: request.jobId ?? null,
+    owner: request.owner ?? null,
+    onOwnerExit: request.onOwnerExit ?? "cancel",
+    brokerDetached: request.owner?.brokerDetached === true,
+    logFile: request.logFile ?? null,
     onTransport: (transport) => {
       if (request.jobId) upsertJobRecord(workspaceRoot, request.jobId, (stored) => ({ ...stored, ...transport, workerStartTime: stored?.worker?.startTime ?? null }));
     },
@@ -843,8 +855,9 @@ function buildTaskRunMetadata({ prompt, resumeLast = false, name = null, followU
   };
 }
 
-function renderQueuedTaskLaunch(payload) {
-  return `${payload.title} started in the background as ${payload.jobId}. Check /codex:status ${payload.jobId} for progress.\n`;
+function renderQueuedTaskLaunch(payload, attach = false) {
+  if (attach) return `CODEX_JOB ${payload.jobId} status=${payload.status} thread=pending log=${payload.logFile}\n`;
+  return `CODEX_JOB_QUEUED id=${payload.jobId} status=queued (NOT finished)\nWait with: node scripts/codex-companion.mjs wait ${payload.jobId} --json\n`;
 }
 
 function getJobKindLabel(kind, jobClass) {
@@ -956,11 +969,28 @@ async function runForegroundCommand(job, runner, options = {}) {
     logFile: options.logFile,
     stderr: !options.json
   });
-  const execution = await runTrackedJob(job, () => runner(progress), { logFile });
-  outputResult(options.json ? execution.payload : execution.rendered, options.json);
-  if (execution.exitStatus !== 0) {
-    process.exitCode = execution.exitStatus;
+  let signalReceived = false;
+  const handlers = [];
+  if (options.handleSignals) {
+    for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+      const handler = () => {
+        signalReceived = true;
+        try { appendControlOp(job.workspaceRoot, job.id, { op: "cancel", reason: "signal" }); } catch {}
+      };
+      process.on(signal, handler);
+      handlers.push([signal, handler]);
+    }
   }
+  let execution;
+  try { execution = await runTrackedJob(job, () => runner(progress, logFile), { logFile }); }
+  finally {
+    for (const [signal, handler] of handlers) process.off(signal, handler);
+    options.heartbeat?.stop();
+  }
+  outputResult(options.json ? execution.payload : execution.rendered, options.json);
+  const recordedStatus = readStoredJob(job.workspaceRoot, job.id)?.status;
+  if (signalReceived || execution.cancelledByControl || recordedStatus === "cancelled") process.exitCode = EXIT.CANCELLED;
+  else if (execution.exitStatus !== 0) process.exitCode = execution.exitStatus;
   return execution;
 }
 
@@ -1056,10 +1086,11 @@ const RUNTIME_BOOLEAN_OPTIONS = ["write", "read-only", "full-access", "network",
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: [...RUNTIME_VALUE_OPTIONS, "cwd", "prompt-file"],
-    booleanOptions: [...RUNTIME_BOOLEAN_OPTIONS, "json", "resume-last", "resume", "fresh", "background"],
+    valueOptions: [...RUNTIME_VALUE_OPTIONS, "cwd", "prompt-file", "on-owner-exit", "owner-pid", "timeout-ms"],
+    booleanOptions: [...RUNTIME_BOOLEAN_OPTIONS, "json", "resume-last", "resume", "fresh", "background", "attach", "detach"],
     aliasMap: {
-      m: "model"
+      m: "model",
+      follow: "attach"
     }
   });
 
@@ -1084,7 +1115,26 @@ async function handleTask(argv) {
   });
   const jobExtra = { name, runtime, cwd };
 
-  if (options.background) {
+  if (options.attach && options.detach) throw new Error("Choose either --attach or --detach.");
+  if ((options.attach || options.detach) && options["owner-pid"]) throw new Error("--owner-pid cannot be combined with --attach or --detach.");
+  const configuredOwnerExit = getConfig(workspaceRoot).onOwnerExit ?? getGlobalConfig().onOwnerExit ?? "cancel";
+  const onOwnerExit = options["on-owner-exit"] ?? ((options.detach || (options.background && !options["owner-pid"])) ? "continue" : configuredOwnerExit);
+  if (!["cancel", "continue"].includes(onOwnerExit)) throw new Error("--on-owner-exit must be cancel or continue.");
+  const ownerPid = options["owner-pid"] === undefined ? null : Number(options["owner-pid"]);
+  if (ownerPid !== null && (!Number.isInteger(ownerPid) || ownerPid <= 0)) throw new Error("--owner-pid must be a positive process id.");
+  const ownerKind = options.attach ? "attach" : options.detach ? "detached" : ownerPid ? "pid" : options.background ? "detached" : "foreground";
+  const owner = {
+    kind: ownerKind,
+    pid: ownerKind === "attach" || ownerKind === "foreground" ? process.pid : ownerKind === "pid" ? ownerPid : null,
+    startTime: ownerKind === "attach" || ownerKind === "foreground" ? readProcessStartTime(process.pid) : ownerKind === "pid" ? readProcessStartTime(ownerPid) : null,
+    heartbeatAt: null,
+    ttlMs: Number(process.env.CODEX_COMPANION_OWNER_TTL_MS) || 30000,
+    brokerDetached: ownerKind === "detached"
+  };
+  jobExtra.owner = owner;
+  jobExtra.onOwnerExit = onOwnerExit;
+
+  if (options.background || options.attach || options.detach) {
     ensureCodexAvailable(cwd);
     requireTaskRequest(prompt, resumeLast);
 
@@ -1098,15 +1148,22 @@ async function handleTask(argv) {
       name,
       ...runtime
     });
-    const { payload } = enqueueBackgroundTask(cwd, job, request);
-    outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+    const { payload, logFile } = enqueueBackgroundTask(cwd, job, request);
+    if (options.attach) {
+      const heartbeat = startHeartbeat(resolveHeartbeatFile(workspaceRoot, job.id, "owner"));
+      try { await followAttachedJob(job.id, workspaceRoot, logFile, options); }
+      finally { heartbeat.stop(); }
+    } else {
+      if (!options.json && owner.kind === "detached" && options.background && !options.detach) process.stderr.write(`Warning: job ${job.id} is unowned (use --attach). Stop it with: node scripts/codex-companion.mjs cancel ${job.id}\n`);
+      outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+    }
     return;
   }
 
   const job = buildTaskJob(workspaceRoot, taskMetadata, write, jobExtra);
   await runForegroundCommand(
     job,
-    (progress) =>
+    (progress, logFile) =>
       executeTaskRun({
         ...buildTaskRequest({
           cwd,
@@ -1117,10 +1174,83 @@ async function handleTask(argv) {
           name,
           ...runtime
         }),
+        owner,
+        onOwnerExit,
+        logFile,
         onProgress: progress
       }),
-    { json: options.json }
+    { json: options.json, handleSignals: true, heartbeat: ownerKind === "foreground" ? startHeartbeat(resolveHeartbeatFile(workspaceRoot, job.id, "owner")) : null }
   );
+}
+
+async function followAttachedJob(jobId, workspaceRoot, logFile, options) {
+  let offset = 0;
+  let interrupted = false;
+  let signalWork = null;
+  const handlers = [];
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    const handler = () => {
+      if (signalWork) return;
+      interrupted = true;
+      signalWork = handleCancel([jobId, "--json"], { quiet: true }).then(
+        () => ({ ok: true }),
+        (error) => ({ ok: false, error })
+      );
+    };
+    process.on(signal, handler);
+    handlers.push([signal, handler]);
+  }
+  process.stdout.write(`CODEX_JOB ${jobId} status=queued thread=pending log=${logFile}\n`);
+  const timeoutMs = Number(options["timeout-ms"]);
+  const started = Date.now();
+  try {
+    for (;;) {
+      let job = readStoredJob(workspaceRoot, jobId);
+      if (fs.existsSync(logFile)) {
+        const contents = fs.readFileSync(logFile, "utf8");
+        const fresh = contents.slice(offset);
+        offset = contents.length;
+        for (const line of fresh.split(/\r?\n/).filter(Boolean).slice(-12)) process.stderr.write(`[job ${jobId}] ${line.replace(/^\[[^\]]+\]\s*/, "")}\n`);
+      }
+      if (interrupted) {
+        const outcome = await signalWork;
+        if (!outcome.ok) {
+          process.stderr.write(`Cancel failed for ${jobId}: ${outcome.error?.message ?? outcome.error}\n`);
+          process.exitCode = EXIT.USAGE;
+          return;
+        }
+        const finalJob = readStoredJob(workspaceRoot, jobId);
+        process.exitCode = finalJob && !isActiveJobStatus(finalJob.status)
+          ? exitCodeForJob(finalJob.status, { mode: "attach" })
+          : EXIT.USAGE;
+        return;
+      }
+      if (timeoutMs > 0 && Date.now() - started >= timeoutMs && isActiveJobStatus(job?.status)) {
+        job = upsertJobRecord(workspaceRoot, jobId, (stored) => {
+          if (!isActiveJobStatus(stored?.status)) return stored;
+          return {
+            ...stored,
+            owner: { ...stored.owner, kind: "detached", pid: null, startTime: null, brokerDetached: true },
+            onOwnerExit: "continue"
+          };
+        });
+        if (!isActiveJobStatus(job?.status)) continue;
+        if (job.threadId && job.transport === "broker") await markBrokerThreadDetached(job.cwd ?? workspaceRoot, { threadId: job.threadId, brokerEndpoint: job.brokerEndpoint }).catch(() => {});
+        process.stdout.write(`Wait with: node scripts/codex-companion.mjs wait ${jobId}\nCancel with: node scripts/codex-companion.mjs cancel ${jobId}\n`);
+        process.exitCode = EXIT.WAITER_TIMEOUT;
+        return;
+      }
+      if (job && !isActiveJobStatus(job.status)) {
+        outputCommandResult({ job, result: job.result ?? null }, job.rendered ?? renderStoredJobResult(job, job), options.json);
+        process.exitCode = exitCodeForJob(job.status, { mode: "attach" });
+        return;
+      }
+      await sleep(100);
+    }
+  } finally {
+    for (const [signal, handler] of handlers) process.off(signal, handler);
+    options.heartbeat?.stop();
+  }
 }
 
 // True once the worker has closed the inbox without ever reading `messageId`,
@@ -1414,7 +1544,7 @@ async function handleTaskWorker(argv) {
     }
     await runTrackedJob(
       { ...storedJob, workspaceRoot, logFile },
-      () => executeTaskRun({ ...request, onProgress: progress }),
+      () => executeTaskRun({ ...request, owner: storedJob.owner ?? null, onOwnerExit: storedJob.onOwnerExit ?? "cancel", logFile, onProgress: progress }),
       { logFile }
     );
     if (hardExitTimer) clearTimeout(hardExitTimer);
@@ -1542,7 +1672,7 @@ function handleTaskResumeCandidate(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
-async function handleCancel(argv) {
+async function handleCancel(argv, internal = {}) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd", "grace-ms"],
     booleanOptions: ["json", "force"]
@@ -1562,7 +1692,7 @@ async function handleCancel(argv) {
     if (["lost", "orphaned"].includes(terminal.status)) {
       resolved = { workspaceRoot, job: terminal };
     } else {
-      outputCommandResult({ jobId: terminal.id, status: terminal.status, title: terminal.title, cancel: terminal.cancel ?? null }, renderCancelReport(terminal), options.json);
+      if (!internal.quiet) outputCommandResult({ jobId: terminal.id, status: terminal.status, title: terminal.title, cancel: terminal.cancel ?? null }, renderCancelReport(terminal), options.json);
       return;
     }
   }
@@ -1571,7 +1701,7 @@ async function handleCancel(argv) {
   const terminal = ["completed", "failed", "cancelled", "cancel-failed", "interrupted", "timed-out"].includes(existing.status ?? job.status);
   if (terminal) {
     const payload = { jobId: job.id, status: existing.status ?? job.status, title: job.title, cancel: existing.cancel ?? null };
-    outputCommandResult(payload, renderCancelReport({ ...job, ...existing }), options.json);
+    if (!internal.quiet) outputCommandResult(payload, renderCancelReport({ ...job, ...existing }), options.json);
     return;
   }
 
@@ -1612,7 +1742,7 @@ async function handleCancel(argv) {
   ack = readControlAck(workspaceRoot, job.id, op.id) ?? ack;
   latest = readStoredJob(workspaceRoot, job.id) ?? latest;
   if (["completed", "failed"].includes(latest.status)) {
-    outputCommandResult(
+    if (!internal.quiet) outputCommandResult(
       { jobId: job.id, status: latest.status, title: job.title, cancel: latest.cancel ?? null, result: latest.result ?? null },
       renderCancelReport({ ...job, ...latest }),
       options.json
@@ -1637,7 +1767,7 @@ async function handleCancel(argv) {
   if (!existing.threadId && !existing.transport && workerExited) turnConfirmedStopped = true;
   latest = readStoredJob(workspaceRoot, job.id) ?? latest;
   if (["completed", "failed"].includes(latest.status)) {
-    outputCommandResult(
+    if (!internal.quiet) outputCommandResult(
       { jobId: job.id, status: latest.status, title: job.title, cancel: latest.cancel ?? null, result: latest.result ?? null },
       renderCancelReport({ ...job, ...latest }),
       options.json
@@ -1668,7 +1798,7 @@ async function handleCancel(argv) {
   upsertJob(workspaceRoot, { id: job.id, status, phase: status, pid: nextJob.pid, completedAt, errorMessage: nextJob.errorMessage });
   appendLogLine(job.logFile, `Cancel ${status}: interrupt ${cancel.interruptDelivered ? "delivered" : "not confirmed"}; worker ${workerExited ? "exited" : "still alive"}; turn ${turnConfirmedStopped ? "stopped" : "not verified"}.`);
   const payload = { jobId: job.id, status, title: job.title, cancel, ...(!verified ? { error: { code: "cancel-failed", message: "Cancellation could not be verified." } } : {}) };
-  outputCommandResult(payload, renderCancelReport(nextJob), options.json);
+  if (!internal.quiet) outputCommandResult(payload, renderCancelReport(nextJob), options.json);
   if (!verified) process.exitCode = EXIT.USAGE;
 }
 

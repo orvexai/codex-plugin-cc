@@ -34,6 +34,20 @@ export function readHeartbeat(file) {
   } catch { return null; }
 }
 
+export function assessOwner(workspaceRoot, job, { now = Date.now() } = {}) {
+  const owner = job?.owner;
+  if (!owner || owner.kind === "detached") return { alive: false, reason: owner?.kind === "detached" ? "detached" : "owner-missing" };
+  const alive = isSameProcess({ pid: Number(owner.pid), startTime: owner.startTime ?? null });
+  if (!alive) return { alive: false, reason: "owner-dead" };
+  const heartbeatFile = resolveHeartbeatFile(workspaceRoot, job.id, "owner");
+  const heartbeat = readHeartbeat(heartbeatFile);
+  const heartbeatAt = Date.parse(heartbeat?.at ?? owner.heartbeatAt ?? "");
+  if (Number.isFinite(heartbeatAt) && now - heartbeatAt > Number(owner.ttlMs || 30000)) {
+    return { alive: false, reason: "owner-heartbeat-stale" };
+  }
+  return { alive: true, reason: null };
+}
+
 export function assessJobLiveness(workspaceRoot, job, { now = Date.now() } = {}) {
   const worker = job.worker ?? {};
   const pid = worker.pid ?? job.pid;

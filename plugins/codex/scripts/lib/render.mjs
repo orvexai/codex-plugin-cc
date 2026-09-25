@@ -156,6 +156,9 @@ function pushJobDetails(lines, job, options = {}) {
   if (job.phase) {
     lines.push(`  Phase: ${job.phase}`);
   }
+  if (job.owner) {
+    lines.push(`  Owner: ${job.owner.kind}${job.ownerAlive ? " (alive)" : " (not alive)"}${job.orphaned ? " [orphaned]" : ""}`);
+  }
   if (options.showElapsed && job.elapsed) {
     lines.push(`  Elapsed: ${job.elapsed}`);
   }
