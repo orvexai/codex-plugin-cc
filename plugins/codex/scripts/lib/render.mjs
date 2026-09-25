@@ -506,10 +506,15 @@ export function renderStoredJobResult(job, storedJob) {
 }
 
 export function renderCancelReport(job) {
+  const cancel = job.cancel ?? {};
+  const status = job.status ?? "cancel-failed";
   const lines = [
     "# Codex Cancel",
     "",
-    `Cancelled ${job.id}.`,
+    `${status === "cancelled" ? "Cancelled" : status === "cancel-failed" ? "Cancellation could not be verified for" : `Job is ${status}:`} ${job.id}.`,
+    `- Interrupt: ${cancel.interruptDelivered ? "delivered" : "not confirmed"}${cancel.detail ? ` (${cancel.detail})` : ""}`,
+    `- Process: worker ${cancel.workerExited ? "exited" : "not verified exited"}${cancel.appServerExited === null || cancel.appServerExited === undefined ? "" : `; direct app-server ${cancel.appServerExited ? "exited" : "still alive"}`}`,
+    `- Verification: ${cancel.turnConfirmedStopped && cancel.workerExited && (job.transport !== "direct" || cancel.appServerExited) ? "verified stopped" : "not verified"}`,
     ""
   ];
 

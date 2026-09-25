@@ -1613,7 +1613,8 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   });
 
   assert.equal(cancelResult.status, 0, cancelResult.stderr);
-  assert.equal(JSON.parse(cancelResult.stdout).status, "cancelled");
+  assert.equal(JSON.parse(cancelResult.stdout).status, "cancelled", cancelResult.stdout);
+  assert.equal(JSON.parse(cancelResult.stdout).cancel.turnConfirmedStopped, true);
 
   await waitFor(() => {
     try {
@@ -1631,7 +1632,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
 
   const stored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
   assert.equal(stored.status, "cancelled");
-  assert.match(fs.readFileSync(logFile, "utf8"), /Cancelled by user/);
+  assert.match(fs.readFileSync(logFile, "utf8"), /Cancel cancelled/);
 });
 
 test("cancel without a job id ignores active jobs from other Claude sessions", () => {
@@ -1732,6 +1733,7 @@ test("cancel with a job id can still target an active job from another Claude se
   });
   assert.equal(cancel.status, 0, cancel.stderr);
   assert.equal(JSON.parse(cancel.stdout).jobId, "task-other");
+  assert.equal(JSON.parse(cancel.stdout).status, "cancelled");
 
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
   assert.equal(state.jobs[0].status, "cancelled");
@@ -1776,8 +1778,7 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cancelResult.status, 0, cancelResult.stderr);
   const cancelPayload = JSON.parse(cancelResult.stdout);
   assert.equal(cancelPayload.status, "cancelled");
-  assert.equal(cancelPayload.turnInterruptAttempted, true);
-  assert.equal(cancelPayload.turnInterrupted, true);
+  assert.equal(cancelPayload.cancel.turnConfirmedStopped, true);
 
   await waitFor(() => {
     const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));

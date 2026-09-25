@@ -4,6 +4,8 @@ import path from "node:path";
 import { isSameProcess, readProcessStartTime } from "./process.mjs";
 import { TERMINAL_STATUSES } from "./exit-codes.mjs";
 import { isSafeJobId, resolveJobsDir, updateJobRecord, writeFileAtomic } from "./state.mjs";
+import { CodexAppServerClient } from "./app-server.mjs";
+import { upsertJobRecord } from "./state.mjs";
 
 export const HEARTBEAT_STALE_MS = Number(process.env.CODEX_COMPANION_HEARTBEAT_STALE_MS) || 30000;
 
@@ -91,4 +93,57 @@ export function reconcileJob(workspaceRoot, job, { now = Date.now(), beforeCommi
       reconciledAt: updated.reconciledAt
     };
   }) ?? updated;
+}
+
+function withTimeout(promise, timeoutMs, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+export async function reconcileJobDeep(workspaceRoot, job) {
+  if (!job || !["lost", "orphaned", "running", "queued"].includes(job.status) || !job.threadId || job.transport !== "broker" || !job.brokerEndpoint) return job;
+  const liveness = assessJobLiveness(workspaceRoot, job);
+  if (job.status !== "lost" && liveness.alive) return job;
+  let client;
+  try {
+    client = await withTimeout(
+      CodexAppServerClient.connect(job.cwd ?? workspaceRoot, { brokerEndpoint: job.brokerEndpoint, noSpawn: true }),
+      3000,
+      "app-server connect"
+    );
+    const response = await withTimeout(
+      client.request("thread/read", { threadId: job.threadId, includeTurns: true }),
+      3000,
+      "thread/read"
+    );
+    const thread = response?.thread;
+    if (!thread || !Array.isArray(thread.turns)) return job;
+    const turns = thread.turns;
+    const active = turns.find((turn) => ["inProgress", "running"].includes(turn.status)) || thread.status?.type === "active";
+    let status = "orphaned";
+    let result = {};
+    if (!active) {
+      const last = turns.at(-1);
+      if (!last || !["completed", "failed", "interrupted"].includes(last.status)) return job;
+      status = last.status === "failed" ? "failed" : "completed";
+      const items = last.items ?? [];
+      const finalMessage = [...items].reverse().find((item) => item.type === "agentMessage" && item.phase === "final_answer")?.text;
+      if (typeof finalMessage === "string") result = { result: { rawOutput: finalMessage } };
+    }
+    return upsertJobRecord(workspaceRoot, job.id, (stored) => ({
+      ...stored,
+      ...result,
+      status,
+      phase: status === "orphaned" ? "orphaned" : "done",
+      reconciled: status !== "orphaned",
+      reconciledAt: new Date().toISOString(),
+      ...(status === "orphaned" ? { errorMessage: "Worker exited while the broker still reports an active turn; cancel the orphaned turn." } : {}),
+      completedAt: status === "orphaned" ? stored?.completedAt : new Date().toISOString()
+    }));
+  } catch { return job; }
+  finally { await client?.close().catch(() => {}); }
 }

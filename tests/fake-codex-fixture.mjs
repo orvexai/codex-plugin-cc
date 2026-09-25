@@ -23,6 +23,7 @@ const readline = require("node:readline");
 	const RPC_PATH = ${JSON.stringify(rpcPath)};
 	const BEHAVIOR = ${JSON.stringify(behavior)};
 	const activeTurns = new Map();
+	const completedTurns = new Map();
 	const interruptibleTurns = new Map();
 	const steerableTurns = new Map();
 	const PROCESS_START_MS = Date.now();
@@ -91,12 +92,12 @@ function buildThread(thread) {
     agentRole: null,
     gitInfo: null,
     name: thread.name || null,
-    turns: active ? [{ id: active.turnId, status: "inProgress" }] : []
+    turns: active ? [{ id: active.turnId, status: "inProgress" }] : completedTurns.has(thread.id) ? [completedTurns.get(thread.id)] : []
   };
 }
 
-function buildTurn(id, status = "inProgress", error = null) {
-  return { id, status, items: [], error };
+function buildTurn(id, status = "inProgress", error = null, items = []) {
+  return { id, status, items, error };
 }
 
 function buildAccountReadResult() {
@@ -179,11 +180,15 @@ function scriptTurn(threadId, turnId, cwd, payload) {
   const steps = Array.isArray(options.turnScript) ? options.turnScript : [];
   const finish = () => {
     if (turn.done) return;
-    if (!finalMessageSent) scriptedItem("item/completed", threadId, turnId, { type: "agentMessage", id: "msg_" + turnId, text: payload, phase: "final_answer" });
+    const finalItems = finalMessageSent ? [] : [{ type: "agentMessage", id: "msg_" + turnId, text: payload, phase: "final_answer" }];
+    if (!finalMessageSent) scriptedItem("item/completed", threadId, turnId, finalItems[0]);
     turn.done = true;
     activeTurns.delete(turnId);
     interruptibleTurns.delete(turnId);
-    notify("turn/completed", { threadId, turn: buildTurn(turnId, options.turnStatus === "failed" ? "failed" : "completed") });
+    const status = options.turnStatus === "failed" ? "failed" : "completed";
+    const completed = buildTurn(turnId, status, null, finalItems);
+    completedTurns.set(threadId, completed);
+    notify("turn/completed", { threadId, turn: completed });
   };
   const runStep = (index) => {
     if (turn.done || turn.interrupted) return;
@@ -273,7 +278,9 @@ function emitTurnCompleted(threadId, turnId, item) {
       send({ method: "item/completed", params: { threadId, turnId, item: entry.completed } });
     }
   }
-  send({ method: "turn/completed", params: { threadId, turn: buildTurn(turnId, "completed") } });
+  const completed = buildTurn(turnId, "completed", null, items.map((entry) => entry?.completed).filter(Boolean));
+  completedTurns.set(threadId, completed);
+  send({ method: "turn/completed", params: { threadId, turn: completed } });
 }
 
 function emitTurnCompletedLater(threadId, turnId, item, delayMs) {

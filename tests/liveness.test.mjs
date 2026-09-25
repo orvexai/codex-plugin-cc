@@ -50,7 +50,7 @@ test("heartbeat writes immediately, refreshes, and can be stopped", async (t) =>
   heartbeat.stop();
 });
 
-test("status and wait reconcile a SIGKILLed background worker to lost", async (t) => {
+test("status and wait reconcile a SIGKILLed background worker to orphaned", async (t) => {
   const ws = await makeCompanionWorkspace("review-ok", { fakeOptions: { turnScript: [{ type: "delay", ms: 60000 }] } });
   t.after(() => ws.close());
   useWorkspaceStateEnv(t, ws);
@@ -67,11 +67,11 @@ test("status and wait reconcile a SIGKILLed background worker to lost", async (t
   try { process.kill(job.worker.pid, "SIGKILL"); } catch {}
   const waited = ws.companion(["wait", id, "--json", "--poll-interval-ms", "100"], { env: { CODEX_COMPANION_HEARTBEAT_MS: "100", CODEX_COMPANION_HEARTBEAT_STALE_MS: "1500" } });
   assert.equal(waited.status, EXIT.LOST, waited.stdout + waited.stderr);
-  assert.equal(JSON.parse(waited.stdout).jobs[0].status, "lost");
+  assert.equal(JSON.parse(waited.stdout).jobs[0].status, "orphaned");
   const lost = await waitFor(() => {
     const result = ws.companion(["status", id, "--json"], { env: { CODEX_COMPANION_HEARTBEAT_MS: "100", CODEX_COMPANION_HEARTBEAT_STALE_MS: "1500" } });
     const finalJob = JSON.parse(result.stdout).job;
-    return result.status === 0 && finalJob.status === "lost" && finalJob.threadId === job.threadId;
+    return result.status === 0 && finalJob.status === "orphaned" && finalJob.threadId === job.threadId;
   }, { timeoutMs: 3000, intervalMs: 50 });
   assert.equal(lost, true);
 });
@@ -288,7 +288,7 @@ test("worker errors before runTrackedJob are captured and referenced by status",
   assert.match(text.stdout, /\.worker\.err/);
 });
 
-test("lost task send returns lost without follow-up and continues the same thread otherwise", async (t) => {
+test("orphaned task send returns orphaned without follow-up and continues the same thread otherwise", async (t) => {
   const ws = await makeCompanionWorkspace("review-ok", { fakeOptions: { turnScript: [{ type: "delay", ms: 60000 }] } });
   t.after(() => ws.close());
   const launched = ws.companion(["task", "--background", "--json", "slow task for send"]);
@@ -303,10 +303,10 @@ test("lost task send returns lost without follow-up and continues the same threa
     return Boolean(job.threadId);
   }, { timeoutMs: 5000, intervalMs: 50 });
   try { process.kill(job.worker.pid, "SIGKILL"); } catch {}
-  await waitFor(() => JSON.parse(ws.companion(["status", id, "--json"]).stdout).job.status === "lost", { timeoutMs: 3000, intervalMs: 50 });
+  await waitFor(() => JSON.parse(ws.companion(["status", id, "--json"]).stdout).job.status === "orphaned", { timeoutMs: 3000, intervalMs: 50 });
   const noFollow = ws.companion(["send", id, "message", "--no-follow-up", "--json"]);
-  assert.equal(noFollow.status, 0, noFollow.stderr);
-  assert.equal(JSON.parse(noFollow.stdout).status, "lost");
+  assert.equal(noFollow.status, EXIT.LOST, noFollow.stderr);
+  assert.equal(JSON.parse(noFollow.stdout).status, "orphaned");
   const continued = ws.companion(["send", id, "continue thread", "--background", "--json"]);
   assert.equal(continued.status, 0, continued.stderr);
   const result = JSON.parse(continued.stdout);

@@ -194,6 +194,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
       windowsHide: true
     });
+    this.pid = this.proc.pid ?? null;
 
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
@@ -340,7 +341,8 @@ export class CodexAppServerClient {
       if (!brokerEndpoint && options.reuseExistingBroker) {
         brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
       }
-      if (!brokerEndpoint && !options.reuseExistingBroker) {
+      if (!brokerEndpoint && options.noSpawn) throw new Error("broker-not-found");
+      if (!brokerEndpoint && !options.reuseExistingBroker && !options.noSpawn) {
         const brokerSession = await ensureBrokerSession(cwd, { env: options.env });
         brokerEndpoint = brokerSession?.endpoint ?? null;
       }

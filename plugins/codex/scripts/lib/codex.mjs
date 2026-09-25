@@ -42,7 +42,8 @@ import path from "node:path";
 import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
-import { binaryAvailable } from "./process.mjs";
+import { binaryAvailable, readProcessStartTime } from "./process.mjs";
+import { ackControlOp, readControlAck, readControlOps } from "./control-channel.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
@@ -759,10 +760,11 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   }
 }
 
-async function withAppServer(cwd, fn) {
+async function withAppServer(cwd, fn, options = {}) {
   let client = null;
   try {
     client = await CodexAppServerClient.connect(cwd);
+    options.onTransport?.({ transport: client.transport, brokerEndpoint: client.endpoint ?? null, appServerPid: client.pid ?? null, appServerStartTime: client.pid ? readProcessStartTime(client.pid) : null });
     const result = await fn(client);
     await client.close();
     return result;
@@ -782,6 +784,7 @@ async function withAppServer(cwd, fn) {
     }
 
     const directClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
+    options.onTransport?.({ transport: directClient.transport, brokerEndpoint: null, appServerPid: directClient.pid ?? null, appServerStartTime: directClient.pid ? readProcessStartTime(directClient.pid) : null, transportFallbackReason: error?.message ?? String(error) });
     try {
       return await fn(directClient);
     } finally {
@@ -1106,8 +1109,8 @@ export async function getCodexAuthStatus(cwd, options = {}) {
   }
 }
 
-export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
-  if (!threadId || !turnId) {
+export async function interruptAppServerTurn(cwd, { threadId, turnId, brokerEndpoint, noSpawn = false }) {
+  if (!threadId) {
     return {
       attempted: false,
       interrupted: false,
@@ -1128,8 +1131,15 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
 
   let client = null;
   try {
-    client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
-    await client.request("turn/interrupt", { threadId, turnId });
+    if (noSpawn && !brokerEndpoint) throw new Error("broker-not-found");
+    client = await CodexAppServerClient.connect(cwd, { brokerEndpoint, noSpawn, reuseExistingBroker: noSpawn });
+    if (!turnId) {
+      const response = await client.request("thread/read", { threadId, includeTurns: true });
+      const turns = response.thread?.turns ?? response.turns ?? [];
+      turnId = [...turns].reverse().find((turn) => ["inProgress", "running"].includes(turn.status))?.id ?? null;
+      if (!turnId) return { attempted: true, interrupted: false, transport: client.transport, detail: "thread has no active turn" };
+    }
+    await withTimeout(client.request("turn/interrupt", { threadId, turnId }), Number(process.env.CODEX_COMPANION_CONTROL_ACK_MS) || 3000, "turn/interrupt acknowledgement timed out");
     return {
       attempted: true,
       interrupted: true,
@@ -1137,12 +1147,40 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
       detail: `Interrupted ${turnId} on ${threadId}.`
     };
   } catch (error) {
+    const brokerGone = noSpawn && (error?.message === "broker-not-found" || ["ENOENT", "ECONNREFUSED", "EPIPE"].includes(error?.code) || /broker socket closed|connection closed/i.test(String(error?.message ?? "")));
     return {
       attempted: true,
       interrupted: false,
       transport: client?.transport ?? null,
-      detail: error instanceof Error ? error.message : String(error)
+      detail: brokerGone ? "broker-not-found" : error instanceof Error ? error.message : String(error),
+      ...(brokerGone ? { errorCode: "broker-not-found" } : {})
     };
+  } finally {
+    await client?.close().catch(() => {});
+  }
+}
+
+export async function waitForAppServerThreadStop(cwd, { threadId, brokerEndpoint, timeoutMs = 0 }) {
+  if (!threadId || !brokerEndpoint) return { confirmed: false, detail: "broker-not-found" };
+  let client;
+  try {
+    client = await CodexAppServerClient.connect(cwd, { brokerEndpoint, noSpawn: true, reuseExistingBroker: true });
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    do {
+      const response = await withTimeout(client.request("thread/read", { threadId, includeTurns: true }), Math.max(100, Math.min(1000, timeoutMs || 1000)), "thread/read timed out");
+      const thread = response?.thread;
+      const turns = thread?.turns;
+      if (Array.isArray(turns) && thread?.status?.type) {
+        const active = thread.status.type === "active" || turns.some((turn) => ["inProgress", "running"].includes(turn.status));
+        if (!active) return { confirmed: true, detail: "thread/read reports idle" };
+      }
+      if (Date.now() >= deadline) return { confirmed: false, detail: "thread/read did not confirm an idle thread" };
+      await new Promise((resolve) => setTimeout(resolve, Math.min(50, deadline - Date.now())));
+    } while (Date.now() <= deadline);
+    return { confirmed: false, detail: "thread/read did not confirm an idle thread" };
+  } catch (error) {
+    const brokerGone = error?.message === "broker-not-found" || ["ENOENT", "ECONNREFUSED", "EPIPE"].includes(error?.code) || /broker socket closed|connection closed/i.test(String(error?.message ?? ""));
+    return { confirmed: false, detail: brokerGone ? "broker-not-found" : error instanceof Error ? error.message : String(error) };
   } finally {
     await client?.close().catch(() => {});
   }
@@ -1247,8 +1285,29 @@ export async function runAppServerTurn(cwd, options = {}) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
+  const alreadyControlled = () => {
+    if (!options.controlFile) return null;
+    const entries = readControlOps(options.controlFile, 0);
+    const op = entries.find((entry) => entry.op === "cancel");
+    if (op && options.workspaceRoot && options.jobId) {
+      ackControlOp(options.workspaceRoot, options.jobId, op.id, { interruptDelivered: false, turnConfirmedStopped: true, noTurn: true });
+      return op;
+    }
+    if (options.workspaceRoot && options.jobId) {
+      for (const entry of entries) {
+        if (entry.op !== "interrupt" || readControlAck(options.workspaceRoot, options.jobId, entry.id)) continue;
+        ackControlOp(options.workspaceRoot, options.jobId, entry.id, { interruptDelivered: false, turnConfirmedStopped: true, noTurn: true });
+      }
+    }
+    return null;
+  };
+  const preConnectOp = alreadyControlled();
+  if (preConnectOp) return { status: 0, cancelledByControl: preConnectOp, threadId: null, turnId: null, finalMessage: "", reasoningSummary: [], touchedFiles: [], commandExecutions: [] };
   return withAppServer(cwd, async (client) => {
     let threadId;
+
+    const preThreadOp = alreadyControlled();
+    if (preThreadOp) return { status: 0, cancelledByControl: preThreadOp, threadId: null, turnId: null, finalMessage: "", reasoningSummary: [], touchedFiles: [], commandExecutions: [] };
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
@@ -1298,13 +1357,18 @@ export async function runAppServerTurn(cwd, options = {}) {
       threadId
     });
 
+    const preTurnOp = alreadyControlled();
+    if (preTurnOp) return { status: 0, cancelledByControl: preTurnOp, threadId, turnId: null, finalMessage: "", reasoningSummary: [], touchedFiles: [], commandExecutions: [] };
+
     const prompt = options.prompt?.trim() || options.defaultPrompt || "";
     if (!prompt) {
       throw new Error("A prompt is required for this Codex run.");
     }
 
     let steering = { stop: async () => [] };
+    let controlPoller = { stop: async () => null };
     let undeliveredMessages = [];
+    let controlledOp = null;
     let turnState;
     try {
       turnState = await captureTurn(
@@ -1327,11 +1391,18 @@ export async function runAppServerTurn(cwd, options = {}) {
               onProgress: options.onProgress,
               onSteered: options.onSteered
             });
+            if (options.controlFile && options.workspaceRoot && options.jobId && response.turn?.id) {
+              controlPoller = startControlPoller(client, threadId, response.turn.id, options);
+            }
           }
         }
       );
     } finally {
-      undeliveredMessages = await steering.stop();
+      try {
+        undeliveredMessages = await steering.stop();
+      } finally {
+        controlledOp = await controlPoller.stop(turnState);
+      }
     }
 
     return {
@@ -1346,9 +1417,54 @@ export async function runAppServerTurn(cwd, options = {}) {
       fileChanges: turnState.fileChanges,
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
       commandExecutions: turnState.commandExecutions,
-      undeliveredMessages
+      undeliveredMessages,
+      cancelledByControl: controlledOp
     };
-  });
+  }, options);
+}
+
+function startControlPoller(client, threadId, turnId, options) {
+  let offset = 0;
+  let inFlight = false;
+  let stopped = false;
+  let pending = null;
+  const tick = async () => {
+    if (inFlight || stopped || pending) return;
+    inFlight = true;
+    try {
+      for (const op of readControlOps(options.controlFile, offset)) {
+        offset = op.end;
+        if (readControlAck(options.workspaceRoot, options.jobId, op.id)) continue;
+        if (op.op !== "cancel" && op.op !== "interrupt") continue;
+        pending = op;
+        let interruptDelivered = false;
+        try { await withTimeout(client.request("turn/interrupt", { threadId, turnId }), Number(process.env.CODEX_COMPANION_CONTROL_ACK_MS) || 3000, "turn/interrupt acknowledgement timed out"); interruptDelivered = true; } catch { /* Stop verification below reports failure. */ }
+        pending.interruptDelivered = interruptDelivered;
+        break;
+      }
+    } finally { inFlight = false; }
+  };
+  const timer = setInterval(() => { void tick(); }, Number(process.env.CODEX_COMPANION_CONTROL_POLL_MS) || 100);
+  timer.unref?.();
+  void tick();
+  return {
+    async stop(state) {
+      try {
+        const settleUntil = Date.now() + 500;
+        while (inFlight && Date.now() < settleUntil) await new Promise((resolve) => setTimeout(resolve, 10));
+        await tick();
+        const deadline = Date.now() + (Number(process.env.CODEX_COMPANION_CANCEL_GRACE_MS) || 10000);
+        while (!pending && state && Date.now() < deadline && !state.completed) await new Promise((resolve) => setTimeout(resolve, 20));
+      } finally {
+        stopped = true;
+        clearInterval(timer);
+      }
+      if (!pending) return null;
+      const turnConfirmedStopped = state?.finalTurn?.status !== "inProgress" && state?.completed === true;
+      ackControlOp(options.workspaceRoot, options.jobId, pending.id, { interruptDelivered: Boolean(pending.interruptDelivered), turnConfirmedStopped, noTurn: false });
+      return pending.op === "cancel" ? { ...pending, turnConfirmedStopped, interruptDelivered: Boolean(pending.interruptDelivered) } : null;
+    }
+  };
 }
 
 export async function findLatestTaskThread(cwd) {
