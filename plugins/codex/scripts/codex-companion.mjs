@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -26,17 +25,21 @@ import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { EXIT, exitCodeForJob, isActiveJobStatus } from "./lib/exit-codes.mjs";
+import { reconcileJob } from "./lib/job-liveness.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
   getConfig,
   getGlobalConfig,
   listJobs,
+  resolveJobFile,
   resolveJobInboxFile,
   setConfig,
   setGlobalConfig,
   upsertJob,
-  writeJobFile
+  writeJobFile,
+  markResultRead
 } from "./lib/state.mjs";
 import {
   buildSingleJobSnapshot,
@@ -55,6 +58,8 @@ import {
   createProgressReporter,
   nowIso,
   runTrackedJob,
+  recordTaskWorker,
+  spawnTaskWorker,
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -98,7 +103,7 @@ const DEFAULT_ENV = {
 const CLEAR_DEFAULT_VALUES = new Set(["", "none", "unset", "default", "clear"]);
 const DEFAULT_WAIT_TIMEOUT_MS = 60 * 60 * 1000;
 const DEFAULT_SEND_ACK_TIMEOUT_MS = 20000;
-const WAIT_TIMEOUT_EXIT_CODE = 124;
+const WAIT_TIMEOUT_EXIT_CODE = EXIT.WAITER_TIMEOUT;
 
 const USAGE = {
   setup: [
@@ -528,10 +533,6 @@ function renderStatusPayload(report, asJson) {
   return asJson ? report : renderStatusReport(report);
 }
 
-function isActiveJobStatus(status) {
-  return status === "queued" || status === "running";
-}
-
 function getCurrentClaudeSessionId() {
   return process.env[SESSION_ID_ENV] ?? null;
 }
@@ -577,9 +578,9 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const sessionId = getCurrentClaudeSessionId();
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
+  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot).map((job) => reconcileJob(workspaceRoot, job))).filter((job) => job.id !== options.excludeJobId);
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
-  const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
+  const activeTask = visibleJobs.find((job) => job.jobClass === "task" && isActiveJobStatus(job.status));
   if (activeTask) {
     throw new Error(`Task ${activeTask.id} is still running. Use /codex:status before continuing it.`);
   }
@@ -944,32 +945,25 @@ async function runForegroundCommand(job, runner, options = {}) {
 
 function spawnDetachedTaskWorker(cwd, jobId) {
   const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
-  const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
-    cwd,
-    env: process.env,
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true
-  });
-  child.unref();
-  return child;
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  return spawnTaskWorker({ scriptPath, cwd, workspaceRoot, jobId, env: process.env });
 }
 
 function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+  const worker = spawnDetachedTaskWorker(cwd, job.id);
+  recordTaskWorker(job.workspaceRoot, job.id, worker);
 
   return {
     payload: {
@@ -1119,6 +1113,8 @@ function missedClosedInbox(inboxFile, messageId) {
 }
 
 async function deliverToRunningJob(workspaceRoot, job, text, timeoutMs) {
+  job = reconcileJob(workspaceRoot, job);
+  if (job.status === "lost") return { status: "lost", jobId: job.id, jobStatus: "lost" };
   const message = { id: generateJobId("msg"), text, createdAt: nowIso() };
   const inboxFile = resolveJobInboxFile(workspaceRoot, job.id);
   fs.appendFileSync(inboxFile, `${JSON.stringify(message)}\n`, "utf8");
@@ -1130,8 +1126,9 @@ async function deliverToRunningJob(workspaceRoot, job, text, timeoutMs) {
     if (current?.deliveredMessageIds?.includes(message.id)) {
       return { status: "delivered", jobId: job.id, messageId: message.id };
     }
-    if (current && !isActiveJobStatus(current.status)) {
-      return { status: "finished-undelivered", jobId: job.id, messageId: message.id, jobStatus: current.status };
+    const reconciled = current ? reconcileJob(workspaceRoot, current) : current;
+    if (reconciled && !isActiveJobStatus(reconciled.status)) {
+      return { status: reconciled.status === "lost" ? "lost" : "finished-undelivered", jobId: job.id, messageId: message.id, jobStatus: reconciled.status };
     }
     if (missedClosedInbox(inboxFile, message.id)) {
       return { status: "finished-undelivered", jobId: job.id, messageId: message.id, jobStatus: "finishing" };
@@ -1184,11 +1181,24 @@ async function handleSend(argv) {
     throw new Error(`Job ${job.id} is a ${job.kindLabel ?? job.jobClass} job; only task jobs accept messages.`);
   }
 
+  if (job.status === "lost" && options["no-follow-up"]) {
+    outputCommandResult({ status: "lost", jobId: job.id }, `${job.id} is lost.\n`, options.json);
+    return;
+  }
+
   if (isActiveJobStatus(job.status)) {
     const timeoutMs =
       options["timeout-ms"] != null ? Math.max(0, Number(options["timeout-ms"]) || 0) : DEFAULT_SEND_ACK_TIMEOUT_MS;
     const delivery = await deliverToRunningJob(workspaceRoot, job, message, timeoutMs);
-    if (delivery.status !== "finished-undelivered" || options["no-follow-up"]) {
+    if (delivery.status === "lost" && options["no-follow-up"]) {
+      outputCommandResult({ status: "lost", jobId: job.id }, `${job.id} is lost.\n`, options.json);
+      return;
+    }
+    if (delivery.status !== "finished-undelivered" && delivery.status !== "lost") {
+      outputCommandResult(delivery, renderDelivery(delivery), options.json);
+      return;
+    }
+    if (options["no-follow-up"]) {
       outputCommandResult(delivery, renderDelivery(delivery), options.json);
       return;
     }
@@ -1309,8 +1319,18 @@ async function handleWait(argv) {
   outputCommandResult(payload, renderWaitReport(payload), options.json);
   if (timedOut) {
     process.exitCode = WAIT_TIMEOUT_EXIT_CODE;
-  } else if (jobs.some((job) => job.status === "failed" || job.status === "cancelled")) {
-    process.exitCode = 1;
+  } else {
+    const codes = jobs.map((job) => exitCodeForJob(job.status, { mode: "wait" }));
+    process.exitCode = codes.includes(EXIT.LOST)
+      ? EXIT.LOST
+      : codes.includes(EXIT.TIMED_OUT)
+        ? EXIT.TIMED_OUT
+        : codes.includes(EXIT.USAGE)
+          ? EXIT.USAGE
+          : codes.includes(EXIT.JOB_FAILED)
+            ? EXIT.JOB_FAILED
+            : EXIT.OK;
+    for (const job of jobs) if (!isActiveJobStatus(job.status)) markResultRead(job.workspaceRoot ?? resolveWorkspaceRoot(cwd), job.id);
   }
 }
 
@@ -1343,38 +1363,26 @@ async function handleTaskWorker(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
-  if (!storedJob) {
-    throw new Error(`No stored job found for ${options["job-id"]}.`);
-  }
+  try {
+    const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
+    if (!storedJob) throw new Error(`No stored job found for ${options["job-id"]}.`);
+    const request = storedJob.request;
+    if (!request || typeof request !== "object") throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
 
-  const request = storedJob.request;
-  if (!request || typeof request !== "object") {
-    throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
+    const { logFile, progress } = createTrackedProgress(
+      { ...storedJob, workspaceRoot },
+      { logFile: storedJob.logFile ?? null }
+    );
+    await runTrackedJob(
+      { ...storedJob, workspaceRoot, logFile },
+      () => executeTaskRun({ ...request, onProgress: progress }),
+      { logFile }
+    );
+  } catch (error) {
+    const stderrFile = path.join(path.dirname(resolveJobFile(workspaceRoot, options["job-id"])), `${options["job-id"]}.worker.err`);
+    fs.appendFileSync(stderrFile, `${error instanceof Error ? error.stack : String(error)}\n`);
+    throw error;
   }
-
-  const { logFile, progress } = createTrackedProgress(
-    {
-      ...storedJob,
-      workspaceRoot
-    },
-    {
-      logFile: storedJob.logFile ?? null
-    }
-  );
-  await runTrackedJob(
-    {
-      ...storedJob,
-      workspaceRoot,
-      logFile
-    },
-    () =>
-      executeTaskRun({
-        ...request,
-        onProgress: progress
-      }),
-    { logFile }
-  );
 }
 
 async function handleStatus(argv) {
@@ -1431,6 +1439,7 @@ function handleResult(argv) {
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveResultJob(cwd, reference);
+  markResultRead(workspaceRoot, job.id);
   const storedJob = readStoredJob(workspaceRoot, job.id);
 
   if (options.output) {
@@ -1466,7 +1475,7 @@ function handleTaskResumeCandidate(argv) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const sessionId = getCurrentClaudeSessionId();
-  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
+  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot).map((job) => reconcileJob(workspaceRoot, job))));
   const candidate = findLatestResumableTaskJob(jobs);
 
   const payload = {

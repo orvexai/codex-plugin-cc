@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 
 import { resolveWorkspaceRoot } from "./workspace.mjs";
+import { isProcessAlive } from "./process.mjs";
+import { TERMINAL_STATUSES } from "./exit-codes.mjs";
 
 const STATE_VERSION = 1;
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
@@ -13,16 +15,6 @@ const STATE_FILE_NAME = "state.json";
 const LOCK_FILE_NAME = "state.lock";
 const JOBS_DIR_NAME = "jobs";
 export const MAX_JOBS = 200;
-const TERMINAL_JOB_STATUSES = new Set([
-  "completed",
-  "failed",
-  "cancelled",
-  "cancel-failed",
-  "interrupted",
-  "timed-out",
-  "lost",
-  "orphaned"
-]);
 const UNREAD_RETENTION_MS = 24 * 60 * 60 * 1000;
 const LOCK_TIMEOUT_MS = 15000;
 const LOCK_STALE_MS = 30000;
@@ -93,18 +85,6 @@ function readLockOwner(lockFile) {
     return owner && typeof owner === "object" ? owner : null;
   } catch {
     return null;
-  }
-}
-
-function isProcessAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) {
-    return false;
-  }
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === "EPERM";
   }
 }
 
@@ -238,7 +218,7 @@ function pruneJobs(jobs, { now = Date.now(), maxJobs = MAX_JOBS } = {}) {
   const protectedJobs = [];
   const otherJobs = [];
   for (const job of jobs) {
-    const terminal = TERMINAL_JOB_STATUSES.has(job.status);
+    const terminal = TERMINAL_STATUSES.has(job.status);
     const completedAt = job.completedAt ?? job.updatedAt;
     const age = Date.parse(completedAt ?? "");
     const unreadAndRecent = terminal && job.resultReadAt == null && Number.isFinite(age) && now - age < UNREAD_RETENTION_MS;
@@ -321,6 +301,39 @@ export function upsertJob(cwd, jobPatch) {
       ...jobPatch,
       updatedAt: timestamp
     };
+  });
+}
+
+export function updateJobRecord(cwd, jobId, mutate) {
+  return withStateLock(cwd, () => {
+    const jobFile = resolveJobFile(cwd, jobId);
+    if (!fs.existsSync(jobFile)) return null;
+    const current = readJobFile(jobFile);
+    const next = mutate(current) ?? current;
+    writeFileAtomic(jobFile, `${JSON.stringify(next, null, 2)}\n`);
+    const state = loadState(cwd);
+    const index = state.jobs.findIndex((job) => job.id === jobId);
+    if (index >= 0) state.jobs[index] = { ...state.jobs[index], ...next, updatedAt: nowIso() };
+    else state.jobs.unshift({ ...next, updatedAt: nowIso() });
+    saveStateUnlocked(cwd, state);
+    return next;
+  });
+}
+
+export function upsertJobRecord(cwd, jobId, mutate) {
+  return withStateLock(cwd, () => {
+    const jobFile = resolveJobFile(cwd, jobId);
+    let current = null;
+    if (fs.existsSync(jobFile)) current = readJobFile(jobFile);
+    if (!current) current = loadState(cwd).jobs.find((job) => job.id === jobId) ?? { id: jobId };
+    const next = mutate(current) ?? current;
+    writeFileAtomic(jobFile, `${JSON.stringify(next, null, 2)}\n`);
+    const state = loadState(cwd);
+    const index = state.jobs.findIndex((job) => job.id === jobId);
+    if (index >= 0) state.jobs[index] = { ...state.jobs[index], ...next, updatedAt: nowIso() };
+    else state.jobs.unshift({ ...next, updatedAt: nowIso() });
+    saveStateUnlocked(cwd, state);
+    return next;
   });
 }
 
@@ -418,24 +431,38 @@ function removeJobFile(jobFile) {
 }
 
 export function resolveJobLogFile(cwd, jobId) {
+  assertSafeJobId(jobId);
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.log`);
 }
 
 export function resolveJobFile(cwd, jobId) {
+  assertSafeJobId(jobId);
   ensureStateDir(cwd);
-  return path.join(resolveJobsDir(cwd), `${jobId}.json`);
+  const jobsDir = path.resolve(resolveJobsDir(cwd));
+  const candidate = path.resolve(jobsDir, `${jobId}.json`);
+  if (!candidate.startsWith(`${jobsDir}${path.sep}`)) throw new Error("Invalid job id.");
+  return candidate;
 }
 
 export function resolveJobInboxFile(cwd, jobId) {
+  assertSafeJobId(jobId);
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.inbox.jsonl`);
+}
+
+export function isSafeJobId(jobId) {
+  return typeof jobId === "string" && jobId.length > 0 && jobId !== "." && jobId !== ".." && !/[\\/\0]/.test(jobId) && !jobId.split(/[\\/]/).includes("..");
+}
+
+function assertSafeJobId(jobId) {
+  if (!isSafeJobId(jobId)) throw new Error("Invalid job id.");
 }
 
 // Job ids are unique across workspaces, so a job launched with --cwd <other>
 // can still be inspected, awaited or messaged from anywhere.
 export function findJobAcrossWorkspaces(jobId) {
-  if (!jobId) {
+  if (!isSafeJobId(jobId)) {
     return null;
   }
   const roots = [...new Set([resolveStateRootDir(), FALLBACK_STATE_ROOT_DIR])];
@@ -450,13 +477,17 @@ export function findJobAcrossWorkspaces(jobId) {
       if (!entry.isDirectory()) {
         continue;
       }
-      const jobFile = path.join(root, entry.name, JOBS_DIR_NAME, `${jobId}.json`);
-      if (!fs.existsSync(jobFile)) {
+      const jobsDir = path.join(root, entry.name, JOBS_DIR_NAME);
+      const jobFile = path.resolve(jobsDir, `${jobId}.json`);
+      if (!jobFile.startsWith(`${path.resolve(jobsDir)}${path.sep}`) || !fs.existsSync(jobFile)) {
         continue;
       }
       try {
+        const realJobsDir = fs.realpathSync.native(jobsDir);
+        const realJobFile = fs.realpathSync.native(jobFile);
+        if (!realJobFile.startsWith(`${realJobsDir}${path.sep}`)) continue;
         const job = readJobFile(jobFile);
-        if (job?.workspaceRoot) {
+        if (job?.id === jobId && job?.workspaceRoot) {
           return job;
         }
       } catch {
