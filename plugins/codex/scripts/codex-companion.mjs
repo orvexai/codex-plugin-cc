@@ -100,22 +100,52 @@ const DEFAULT_WAIT_TIMEOUT_MS = 60 * 60 * 1000;
 const DEFAULT_SEND_ACK_TIMEOUT_MS = 20000;
 const WAIT_TIMEOUT_EXIT_CODE = 124;
 
-function printUsage() {
-  console.log(
-    [
-      "Usage:",
-      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--default-model <m|none>] [--default-effort <e|none>] [--default-sandbox <mode|none>] [--default-network <on|off|none>] [--global] [--install-cli [--bin-dir <dir>]] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write|--read-only|--full-access|--sandbox <read-only|workspace-write|danger-full-access>] [--network|--no-network] [--name <label>] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--cwd <dir>] [--prompt-file <file>] [prompt]",
-      "  node scripts/codex-companion.mjs send <job-id> [--background] [--timeout-ms <ms>] [--no-follow-up] [--prompt-file <file>] [message]",
-      "  node scripts/codex-companion.mjs wait [job-id...] [--any] [--timeout-ms <ms>] [--json]",
-      "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
-      "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
-      "  node scripts/codex-companion.mjs result [job-id] [--output <file>] [--json]",
-      "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
-    ].join("\n")
-  );
+const USAGE = {
+  setup: [
+    "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--default-model <m|none>] [--default-effort <e|none>] [--default-sandbox <mode|none>] [--default-network <on|off|none>] [--global] [--install-cli [--bin-dir <dir>]] [--json]",
+  ],
+  review: [
+    "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
+  ],
+  "adversarial-review": [
+    "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+  ],
+  task: [
+    "  node scripts/codex-companion.mjs task [--background] [--write|--read-only|--full-access|--sandbox <read-only|workspace-write|danger-full-access>] [--network|--no-network] [--name <label>] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--cwd <dir>] [--prompt-file <file>] [prompt]",
+  ],
+  send: [
+    "  node scripts/codex-companion.mjs send <job-id> [--background] [--timeout-ms <ms>] [--no-follow-up] [--prompt-file <file>] [message]",
+  ],
+  wait: [
+    "  node scripts/codex-companion.mjs wait [job-id...] [--any] [--timeout-ms <ms>] [--json]",
+  ],
+  transfer: [
+    "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
+  ],
+  status: [
+    "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
+  ],
+  result: [
+    "  node scripts/codex-companion.mjs result [job-id] [--output <file>] [--json]",
+  ],
+  cancel: [
+    "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
+  ],
+  "task-worker": ["  node scripts/codex-companion.mjs task-worker --job-id <id> [--cwd <dir>]"],
+  "task-resume-candidate": ["  node scripts/codex-companion.mjs task-resume-candidate [--cwd <dir>] [--json]"]
+};
+
+function printUsage(subcommand) {
+  const lines = subcommand ? USAGE[subcommand] ?? [] : Object.values(USAGE).flat();
+  console.log(["Usage:", ...lines].join("\n"));
+}
+
+function printHelpIfRequested(options, subcommand) {
+  if (!options.help) {
+    return false;
+  }
+  printUsage(subcommand);
+  return true;
 }
 
 function normalizeSandboxMode(value) {
@@ -303,6 +333,8 @@ function normalizeArgv(argv) {
 function parseCommandInput(argv, config = {}) {
   return parseArgs(normalizeArgv(argv), {
     ...config,
+    strict: config.strict ?? true,
+    booleanOptions: [...(config.booleanOptions ?? []), "help"],
     aliasMap: {
       C: "cwd",
       ...(config.aliasMap ?? {})
@@ -393,6 +425,8 @@ async function handleSetup(argv) {
     valueOptions: ["cwd", "default-model", "default-effort", "default-sandbox", "default-network", "bin-dir"],
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate", "global", "install-cli"]
   });
+
+  if (printHelpIfRequested(options, "setup")) return;
 
   if (options["enable-review-gate"] && options["disable-review-gate"]) {
     throw new Error("Choose either --enable-review-gate or --disable-review-gate.");
@@ -958,6 +992,8 @@ async function handleReviewCommand(argv, config) {
     }
   });
 
+  if (printHelpIfRequested(options, config.usageName ?? "review")) return;
+
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const focusText = positionals.join(" ").trim();
@@ -995,6 +1031,7 @@ async function handleReviewCommand(argv, config) {
 async function handleReview(argv) {
   return handleReviewCommand(argv, {
     reviewName: "Review",
+    usageName: "review",
     validateRequest: validateNativeReviewRequest
   });
 }
@@ -1010,6 +1047,8 @@ async function handleTask(argv) {
       m: "model"
     }
   });
+
+  if (printHelpIfRequested(options, "task")) return;
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
@@ -1126,6 +1165,8 @@ async function handleSend(argv) {
     }
   });
 
+  if (printHelpIfRequested(options, "send")) return;
+
   const cwd = resolveCommandCwd(options);
   const [reference, ...messageParts] = positionals;
   if (!reference) {
@@ -1224,6 +1265,8 @@ async function handleWait(argv) {
     booleanOptions: ["json", "any"]
   });
 
+  if (printHelpIfRequested(options, "wait")) return;
+
   const cwd = resolveCommandCwd(options);
   const timeoutMs =
     options["timeout-ms"] != null ? Math.max(0, Number(options["timeout-ms"]) || 0) : DEFAULT_WAIT_TIMEOUT_MS;
@@ -1277,6 +1320,8 @@ async function handleTransfer(argv) {
     booleanOptions: ["json"]
   });
 
+  if (printHelpIfRequested(options, "transfer")) return;
+
   const cwd = resolveCommandCwd(options);
   const { payload, rendered } = await executeTransfer(cwd, {
     source: options.source
@@ -1286,8 +1331,11 @@ async function handleTransfer(argv) {
 
 async function handleTaskWorker(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "job-id"]
+    valueOptions: ["cwd", "job-id"],
+    strict: false
   });
+
+  if (printHelpIfRequested(options, "task-worker")) return;
 
   if (!options["job-id"]) {
     throw new Error("Missing required --job-id for task-worker.");
@@ -1335,6 +1383,8 @@ async function handleStatus(argv) {
     booleanOptions: ["json", "all", "wait"]
   });
 
+  if (printHelpIfRequested(options, "status")) return;
+
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
   if (reference) {
@@ -1376,6 +1426,8 @@ function handleResult(argv) {
     }
   });
 
+  if (printHelpIfRequested(options, "result")) return;
+
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveResultJob(cwd, reference);
@@ -1408,6 +1460,8 @@ function handleTaskResumeCandidate(argv) {
     valueOptions: ["cwd"],
     booleanOptions: ["json"]
   });
+
+  if (printHelpIfRequested(options, "task-resume-candidate")) return;
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
@@ -1443,6 +1497,8 @@ async function handleCancel(argv) {
     valueOptions: ["cwd"],
     booleanOptions: ["json"]
   });
+
+  if (printHelpIfRequested(options, "cancel")) return;
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
@@ -1502,7 +1558,7 @@ async function handleCancel(argv) {
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
-    printUsage();
+    printUsage(subcommand === "help" ? argv[0] : undefined);
     return;
   }
 
@@ -1515,7 +1571,8 @@ async function main() {
       break;
     case "adversarial-review":
       await handleReviewCommand(argv, {
-        reviewName: "Adversarial Review"
+        reviewName: "Adversarial Review",
+        usageName: "adversarial-review"
       });
       break;
     case "task":
@@ -1550,8 +1607,9 @@ async function main() {
   }
 }
 
+let activeSubcommand = process.argv[2];
 main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
+  process.stderr.write(`${message}\nRun "${activeSubcommand || "codex-companion"} --help" for usage.\n`);
+  process.exitCode = error?.exitCode ?? 1;
 });
