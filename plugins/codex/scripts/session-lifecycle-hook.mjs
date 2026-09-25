@@ -9,14 +9,19 @@ import { refreshCliShim } from "./lib/cli-shim.mjs";
 import { terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
-  clearBrokerSession,
+  addBrokerLease,
+  claimBrokerSessionForShutdown,
   LOG_FILE_ENV,
   loadBrokerSession,
   PID_FILE_ENV,
+  removeBrokerLease,
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { appendControlOp } from "./lib/control-channel.mjs";
+import { reconcileJob } from "./lib/job-liveness.mjs";
+import { isActiveJobStatus } from "./lib/exit-codes.mjs";
+import { getConfig, getGlobalConfig, isSafeJobId, listJobs, resolveJobsDir, resolveStateFile, updateJobRecord, writeFileAtomic } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -44,41 +49,61 @@ function appendEnvVar(name, value) {
 }
 
 function cleanupSessionJobs(cwd, sessionId) {
-  if (!cwd || !sessionId) {
-    return;
-  }
-
+  if (!cwd || !sessionId) return { jobs: [], activeJobsRemain: listJobs(cwd || process.cwd()).some((job) => isActiveJobStatus(job.status)) };
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const stateFile = resolveStateFile(workspaceRoot);
-  if (!fs.existsSync(stateFile)) {
-    return;
-  }
-
-  const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
-  if (removedJobs.length === 0) {
-    return;
-  }
-
-  for (const job of removedJobs) {
-    const stillRunning = job.status === "queued" || job.status === "running";
-    if (!stillRunning) {
-      continue;
+  const hasState = fs.existsSync(stateFile);
+  const policy = hasState ? (getConfig(workspaceRoot).sessionEndPolicy ?? getGlobalConfig().sessionEndPolicy ?? "cancel") : "cancel";
+  const sessionJobs = hasState ? listJobs(workspaceRoot).filter((job) => job.sessionId === sessionId).map((job) => reconcileJob(workspaceRoot, job)) : [];
+  const summaryJobs = [];
+  for (const job of sessionJobs) {
+    let action = "none";
+    if (isActiveJobStatus(job.status)) {
+      const detach = job.owner?.kind === "detached" || policy === "detach";
+      const endedAt = new Date().toISOString();
+      if (detach) {
+        const updated = updateJobRecord(workspaceRoot, job.id, (stored) => isActiveJobStatus(stored?.status)
+          ? { ...stored, endedWithSession: true, sessionEndedAt: endedAt }
+          : stored);
+        if (isActiveJobStatus(updated?.status)) action = "detached";
+      } else {
+        let controlWritten = false;
+        try {
+          appendControlOp(workspaceRoot, job.id, { op: "cancel", reason: "session-ended" });
+          controlWritten = true;
+        } catch {
+          // Legacy records can predate the control channel; fall back to their worker pid.
+        }
+        const updated = updateJobRecord(workspaceRoot, job.id, (stored) => isActiveJobStatus(stored?.status)
+          ? { ...stored, status: "cancel-pending", cancelReason: "session-ended", sessionEndedAt: endedAt }
+          : stored);
+        if (isActiveJobStatus(updated?.status)) action = "cancel-requested";
+        if (action === "cancel-requested" && (!controlWritten || job.schemaVersion == null || job.schemaVersion < 2 || !job.transport) && job.pid) {
+          try { terminateProcessTree(job.pid); } catch { /* Best effort during hook shutdown. */ }
+        }
+      }
     }
-    try {
-      terminateProcessTree(job.pid ?? Number.NaN);
-    } catch {
-      // Ignore teardown failures during session shutdown.
+    const current = listJobs(workspaceRoot).find((candidate) => candidate.id === job.id) ?? job;
+    summaryJobs.push({ id: current.id, status: current.status, action, threadId: current.threadId ?? null });
+  }
+  const endedAt = new Date().toISOString();
+  const summary = { sessionId, endedAt, jobs: summaryJobs };
+  if (isSafeJobId(sessionId)) {
+    const jobsDir = path.resolve(resolveJobsDir(workspaceRoot));
+    const summaryFile = path.resolve(jobsDir, `session-end-${sessionId}.json`);
+    if (summaryFile.startsWith(`${jobsDir}${path.sep}`)) {
+      writeFileAtomic(summaryFile, `${JSON.stringify(summary, null, 2)}\n`);
     }
   }
-
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
-  });
+  const activeJobsRemain = hasState && listJobs(workspaceRoot).map((job) => reconcileJob(workspaceRoot, job)).some((job) => isActiveJobStatus(job.status));
+  return { jobs: summaryJobs, activeJobsRemain };
 }
 
 function handleSessionStart(input) {
+  const cwd = input.cwd || process.cwd();
+  if (input.session_id && loadBrokerSession(cwd)) {
+    addBrokerLease(cwd, { sessionId: input.session_id, pid: process.ppid });
+  }
   appendEnvVar(SESSION_ID_ENV, input.session_id);
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
@@ -92,8 +117,9 @@ function handleSessionStart(input) {
 
 async function handleSessionEnd(input) {
   const cwd = input.cwd || process.cwd();
-  const brokerSession =
-    loadBrokerSession(cwd) ??
+  const storedBrokerSession = loadBrokerSession(cwd);
+  let brokerSession =
+    storedBrokerSession ??
     (process.env[BROKER_ENDPOINT_ENV]
       ? {
           endpoint: process.env[BROKER_ENDPOINT_ENV],
@@ -101,6 +127,16 @@ async function handleSessionEnd(input) {
           logFile: process.env[LOG_FILE_ENV] ?? null
         }
       : null);
+  const sessionId = input.session_id || process.env[SESSION_ID_ENV];
+  const result = cleanupSessionJobs(cwd, sessionId);
+  if (sessionId) removeBrokerLease(cwd, sessionId);
+  if (result.activeJobsRemain) return;
+  if (storedBrokerSession) {
+    const claim = claimBrokerSessionForShutdown(cwd);
+    if (!claim.shouldShutdown) return;
+    brokerSession = claim.session;
+  }
+
   const brokerEndpoint = brokerSession?.endpoint ?? null;
   const pidFile = brokerSession?.pidFile ?? null;
   const logFile = brokerSession?.logFile ?? null;
@@ -111,7 +147,6 @@ async function handleSessionEnd(input) {
     await sendBrokerShutdown(brokerEndpoint);
   }
 
-  cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
   teardownBrokerSession({
     endpoint: brokerEndpoint,
     pidFile,
@@ -120,7 +155,6 @@ async function handleSessionEnd(input) {
     pid,
     killProcess: terminateProcessTree
   });
-  clearBrokerSession(cwd);
 }
 
 async function main() {

@@ -1802,7 +1802,7 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
-test("session end fully cleans up jobs for the ending session", async (t) => {
+test("session end cancels running jobs and keeps their records", async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
@@ -1904,10 +1904,12 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(fs.existsSync(otherSessionLog), true);
   assert.equal(fs.existsSync(otherJobFile), true);
-  assert.deepEqual(
-    fs.readdirSync(path.dirname(otherJobFile)).sort(),
-    [path.basename(otherJobFile), path.basename(otherSessionLog)].sort()
-  );
+  assert.equal(fs.existsSync(completedJobFile), true);
+  assert.equal(fs.existsSync(completedLog), true);
+  assert.equal(fs.existsSync(runningJobFile), true);
+  assert.equal(fs.existsSync(runningLog), true);
+  assert.equal(fs.existsSync(otherJobFile), true);
+  assert.equal(fs.existsSync(otherSessionLog), true);
 
   await waitFor(() => {
     try {
@@ -1919,9 +1921,11 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   });
 
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-  assert.deepEqual(state.jobs.map((job) => job.id), ["review-other"]);
-  const otherJob = state.jobs[0];
-  assert.equal(otherJob.logFile, otherSessionLog);
+  assert.deepEqual(state.jobs.map((job) => job.id).sort(), ["review-completed", "review-running", "review-other"].sort());
+  const runningJob = state.jobs.find((job) => job.id === "review-running");
+  assert.ok(["cancel-pending", "lost"].includes(runningJob.status));
+  assert.equal(runningJob.cancelReason, "session-ended");
+  assert.ok(fs.existsSync(path.join(jobsDir, "session-end-sess-current.json")));
 });
 
 test("stop hook runs a stop-time review task and blocks on findings when the review gate is enabled", () => {
